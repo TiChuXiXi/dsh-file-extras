@@ -1,0 +1,12 @@
+# 自检用的临时依赖与产物（react/react-dom UMD、headless 浏览器 profile、截图）
+.npm-cache/
+out/
+# 插件里不必要的发布噪声
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
+# 发布令牌（不进 git / 不进发布包）
+.npmrc
+# Windows 文件权限诊断的恢复目录（本地诊断证据，不进库）
+.acl-recovery/

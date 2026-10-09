@@ -1,0 +1,48 @@
+{
+  "name": "dsh-file-extras",
+  "version": "0.1.0",
+  "description": "DSH Web GUI 的工作区文件树增强：行内显示大小与修改日期，右键菜单提供下载 / 上传 / 复制路径。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "file-manager",
+    "context-menu",
+    "web-ui"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TiChuXiXi/dsh-file-extras.git"
+  },
+  "homepage": "https://github.com/TiChuXiXi/dsh-file-extras#readme"
+}

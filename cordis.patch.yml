@@ -1,0 +1,11 @@
+# dsh-file-extras bundle patch —— 把插件行插入 profile 组合。
+# 行按【包名】引用（不是相对路径）：patch 只贡献配置，不改变 loader 的基准目录。
+# 安装：dsh plugin --profile web add <本目录>，或由 plugin_manager install_bundle 完成。
+- insert:
+    - id: file-extras
+      name: dsh-file-extras
+      # loader **行级** inject（模块里 export 的 inject 管不到这一行）：
+      #   webServer  —— 挂 /dsh-file-extras 这条前缀路由（RPC + 下载 + 上传）；
+      #   connection —— 复用它的 requestRejection() 做信任栅栏（Host/Origin + 浏览器签名 cookie）。
+      # 少任何一个，启动时都会报 cannot get property "xxx" without inject 整棵树加载失败。
+      inject: [webServer, connection]
