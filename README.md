@@ -5,11 +5,29 @@ DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`
 | 需求 | 现在的行为 |
 | --- | --- |
 | 覆盖默认浏览器右键菜单 | 在文件树内右键弹出自己的菜单（树外一律不接管，浏览器默认菜单照旧） |
-| 文件右键 | **下载** / **复制路径** |
-| 文件夹右键 | **上传文件到此处…** / **复制路径** |
-| 空白处右键 | **上传文件到此处…** / **复制路径** / **刷新大小与日期**（空白归属它所在的那层目录；根空白归工作区根） |
+| 文件右键 | **下载** / **复制路径** / **删除** |
+| 文件夹右键 | **上传文件到此处…** / **复制路径** / **删除** |
+| 空白处右键 | **上传文件到此处…** / **复制路径** / **刷新大小与日期** / **全选可见项**（有选择时再加 **清除选择** 与 **删除 N 项**） |
 | 文件大小 + 修改日期 | 行尾显示 `1.2 KB · 2026-03-04 13:06:07`，按字节自动选单位（B/KB/MB/GB/TB/PB，1024 进制） |
 | 文件夹大小 + 修改日期 | 行尾显示 `3 项 · 2026-03-04 13:06:07`；**只数第一级子级**（`readdir` 一层，不递归） |
+| 删除（文件夹 / 单文件 / 多文件） | 走 **二次确认框**（列出每一项是什么、多大、文件夹含多少内容）；默认**移到回收站**（可还原），「永久删除」藏在默认不勾的复选框后面 |
+
+## 多选怎么用
+
+官方那棵树没有多选，本插件自己实现了一套，规矩和资源管理器一致：
+
+| 操作 | 效果 |
+| --- | --- |
+| 普通单击 | 清空选择（并放行官方行为：文件打开、目录展开） |
+| `Ctrl` / `⌘` + 单击 | 切换这一行的选中态（**拦下**官方行为，不会顺手打开文件或展开目录） |
+| `Shift` + 单击 | 从锚点行到这一行整段选中（按可见行的 DOM 顺序） |
+| 空白处单击 | 清空选择 |
+| 空白处右键 → 全选可见项 | 一次选中当前树里所有可见行 |
+| `Esc` | 分层收：确认框 → 右键菜单 → 选择 |
+
+选中态是**填色 + 一圈内描边**（只填色会跟 `:hover` 撞成一样）。右键落在已选中的行上时，菜单作用整个选择
+（标题变成 `已选 N 项`，删除项变成 `删除 N 项`，多选时不再提供只能作用于单项的下载/上传）；
+右键落在没选中的行上则把选择换成那一行 —— 不会出现「看着选中了 5 个，结果只删了右键的那一个」。
 
 ## 为什么需要 host 半区
 
@@ -21,9 +39,21 @@ host 半区在 `ctx.webServer` 上挂一条前缀路由 `/dsh-file-extras`：
 
 - `POST /dsh-file-extras/stat` —— Connection RPC 信封，批量取 大小 / mtime / 一级子项数量；
 - `GET  /dsh-file-extras/download?root=&path=` —— 流式回文件字节 + `Content-Disposition`；
-- `POST /dsh-file-extras/upload?root=&dir=&name=` —— 请求体即原始字节，写进目标目录。
+- `POST /dsh-file-extras/upload?root=&dir=&name=` —— 请求体即原始字节，写进目标目录；
+- `POST /dsh-file-extras/remove` —— 删除（RPC 信封），默认移入回收站，逐条独立结算。
 
 浏览器的右键菜单注册进 `shell.overlay`（框架级浮层，本来就在每一列之上、滚动容器之外）。
+
+## 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| [index.js](index.js) | host 半区：`/dsh-file-extras` 前缀路由 —— RPC `stat`（大小 / mtime / 一级子项数）、`remove`、`GET download`、`POST upload` |
+| [lib/trash.js](lib/trash.js) | 跨平台「移入回收站」：Windows / Linux / macOS 三套后端；平台与家目录可注入，所以三套逻辑能在任意一台机器上实测 |
+| [lib/client.js](lib/client.js) | 浏览器半区：行内元数据 + 多选 + 右键菜单 + 删除确认框（注册进 `shell.overlay`） |
+| [cordis.patch.yml](cordis.patch.yml) | loader 行（`inject: [webServer, connection]`） |
+| [package.json](package.json) | `dsh.bundle` + `dsh.client` |
+| [scripts/selftest.mjs](scripts/selftest.mjs) / [scripts/dom-probe.mjs](scripts/dom-probe.mjs) / [scripts/trash-bin.mjs](scripts/trash-bin.mjs) | 两层自检 + 回收站测试清理助手 |
 
 ## 安装
 
@@ -45,7 +75,17 @@ dsh plugin --profile web add dsh-file-extras
 - `root` 必须是绝对路径、存在、且**不是盘符/文件系统根**（否则「声明 root=C:\ 就能读全盘」）；
 - 每个候选路径都做 realpath 后再比包含关系 —— 工作区内的软链接指向区外同样被拒（纯字符串前缀比对比不了这一层）；
 - 上传只写**单段文件名**（`..\..\x` 会被压成 `x`），重名一律自动加序号 `name (1).ext`，**从不覆盖**已有文件；
-- 下载上限 512 MiB、上传上限 256 MiB，超限回 `413` 而不是截断。
+- 上传先写同目录 `.part-<uuid>` 再原子 rename，中途失败/超限不会在工作区留下半个「看起来正常」的文件；
+- **两端都不设文件大小上限**：下载是磁盘→socket 的流式传输，上传是请求流→磁盘，host 内存占用与文件大小无关。上传只在 `content-length` 明显失控（>4 GiB）时提前挡掉。
+- **删除默认进回收站，跨平台三套后端**（[lib/trash.js](lib/trash.js)）：
+  Windows 走 Shell 的 `SHFileOperation`（PowerShell 5.1 + `Microsoft.VisualBasic`），
+  Linux 走 freedesktop Trash 规范（`~/.local/share/Trash/{files,info}`），macOS 走 `~/.Trash`。
+  回收站不可用时**报错**，绝不静默降级成永久删除 —— 用户自己勾「永久删除」才走 `fs.rm`。
+- 删除的安全边界：浏览器侧必须过二次确认框；host 侧拒绝工作区**根自己**、拒绝区外路径；
+  软链接按「链接本身」处理，绝不跟随到区外去递归删目标（`checkEntry` 按目录项判定包含关系）。
+  Windows 上软链接**不进回收站**（`DeleteDirectory` 会顺着联接点递归），直接 `fs.rm`；
+  POSIX 上 `rename` 只搬链接本身，所以照常进回收站。
+- 一批里有一个删不掉（被占用、权限不足、回收站拒收）只影响它自己，失败原因按条回给用户。
 
 ## 实现要点（改代码前先读）
 
@@ -57,16 +97,36 @@ dsh plugin --profile web add dsh-file-extras
   属性写入放在 `requestAnimationFrame` 里：换行会让行变高，直接在观察回调里改会触发
   `ResizeObserver loop completed with undelivered notifications`。
 - **错误状态码分两套**。RPC 端点失败也回 `200` + 错误信封（`rpc.call` 把非 2xx 当传输失败，
-  读不到信封里的错误码）；`download` / `upload` 是字节通道，失败回真正的 `4xx`，
-  客户端按 `response.ok` 判；下载另外按 `content-type` 兜一层，避免把错误 JSON 存成文件。
+  读不到信封里的错误码）；`download` / `upload` 是字节通道，失败回真正的 `4xx`。
+- **大文件不要经过 JS 内存**。下载刻意**不用** `fetch` + `response.blob()`：那个写法要等整个文件
+  传完、并在页面里拼出一份完整副本之后 promise 才 resolve，大文件于是「点下去很久没反应」，
+  还要吃掉同等内存、最后再从内存写一遍盘。现在改成 `stat` 预检（毫秒级，失败能说清原因）+
+  `<a download>` 原生导航（字节由 host 直接流到磁盘，立即开始、内存零拷贝、无大小上限）。
+  上传同理：进度提示在传输开始前就弹出来，host 侧边收边写。
+- **回收站不是文件系统特性，是 Shell 特性**。`fs.rm` / `unlink` / `rmdir` 落到内核的删除原语，
+  删掉就是删掉；真正「移入回收站」的在 Windows 上是 `SHFileOperation`（要在
+  `<卷>:\$Recycle.Bin\<SID>\` 下写一对 `$I`（元数据）+ `$R`（数据）文件并登记进用户回收站索引，
+  手工挪文件进去没用 —— 没有 `$I` 边车，资源管理器列不出来也还原不了），在 Linux 上是
+  freedesktop Trash 规范，在 macOS 上就是 `~/.Trash`。三套机制 Node 一个都不提供，
+  所以 [lib/trash.js](lib/trash.js) 自己实现：Windows 外包给 PowerShell 5.1 的
+  `Microsoft.VisualBasic.FileIO.FileSystem`（内部就是 `SHFileOperation`），
+  Linux / macOS 直接按协议搬目录、写 `.trashinfo`。
 
 ## 自检
 
 ```powershell
-node scripts/selftest.mjs                  # host 半区：假 ctx/req/res 驱动路由，18 个用例（真文件系统）
-node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，35 条断言
-node scripts/dom-probe.mjs --shot out/     # 同上，另存浅色/深色两张截图
+node scripts/selftest.mjs                  # host 半区：假 ctx/req/res 驱动路由，35 个用例（真文件系统 + 三套回收站后端）
+node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，58 条断言
+node scripts/dom-probe.mjs --shot out/     # 同上，另存浅色（多选+菜单）与深色（删除确认框）两张截图
 ```
+
+`selftest.mjs` 里 Linux / macOS 两条回收站后端是**注入平台与家目录**后真跑的（不是 mock）：
+在 Windows 上把文件搬进一个假的 `~/.local/share/Trash`，再逐字校验 `files/` 落盘、
+`info/*.trashinfo` 的 `Path=` 能还原原路径、`DeletionDate` 格式、以及同名让位成 `<名字>.2`。
+测试往真回收站扔的东西由 [scripts/trash-bin.mjs](scripts/trash-bin.mjs) 按快照差集清干净。
+
+`dom-probe.mjs` 会把完整结果写到 `.npm-cache/domprobe/last-result.json`，断言消息只留 300 字摘要。
+复选框那几步走的是 CDP 的真实鼠标事件（合成事件驱动不了 checkbox 的激活行为，详见脚本内注释）。
 
 `dom-probe.mjs` 需要 react/react-dom 的 UMD 构建：
 
@@ -88,3 +148,11 @@ npm install --prefix .npm-cache/domprobe --cache .npm-cache --registry=https://r
 - 元数据每 15 秒后台重取一次（仅页面可见时）。文件在会话里被反复改写、行节点又被 React 复用，
   不重取就会一直显示旧值。
 - 「刷新」按的是官方的重载按钮（`data-files-reload`），不自己维护目录状态。
+- 选择状态由本插件维护（行元素上的 `data-fx-selected` 属性是唯一真相），每次同步按 DOM 里实际还在的行剪枝：
+  折叠、刷新、删掉的行会自动掉出选择。
+- **回收站的平台差异**：手工把文件挪进 macOS 的 `~/.Trash` 不会写 Finder 的「放回原处」元数据
+  （那在 `.DS_Store` 里，只有 Finder 自己写），所以文件能还原、但「放回原处」不可用。
+  Linux 跨卷时会用该卷根下的 `.Trash/<uid>` 或 `.Trash-<uid>`（规范要求）。
+  回收站被系统关掉、或条目超过回收站配额时，**Windows / macOS 自己会改成永久删除** —— 那是系统的行为，插件无法区分。
+- 没有回收站后端的平台（FreeBSD 等）会明确回 `file-extras/trash-unavailable`，
+  确认框里勾「永久删除」仍可继续。

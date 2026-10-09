@@ -7,8 +7,14 @@
  * 拿不到 mtime，需要本半区补上：
  *
  *   1. RPC `stat`    —— 批量取 大小 / 修改时间 / **一级**子项数量（不递归，readdir 一层即止）；
- *   2. GET  download —— 按路径回字节 + Content-Disposition，浏览器侧 fetch→Blob→落盘；
- *   3. POST upload   —— 收原始字节写进目标目录，重名自动加序号，**绝不覆盖**已有文件。
+ *   2. GET  download —— 流式回字节 + Content-Disposition，**不设大小上限**：字节从磁盘直接进
+ *      socket，客户端那边是浏览器原生下载，两端都不经过内存，大文件立即开始；
+ *   3. POST upload   —— 流式收原始字节，先写同目录 `.part-<uuid>` 再原子 rename；
+ *      重名自动加序号，**绝不覆盖**已有文件；
+ *   4. RPC `remove`  —— 删除（文件夹连同其全部内容）。**默认走回收站**（Shell 的 SHFileOperation，
+ *      可还原），`permanent: true` 才走 fs.rm。逐条独立结算；拒绝工作区根、拒绝区外路径，
+ *      软链接只删链接本身、绝不跟随。浏览器侧负责二次确认，并用一个默认不勾的复选框把
+ *      「移到回收站」和「永久删除」两条路分开。
  *
  * 依赖策略（照抄 dsh-git-vcs 踩过的坑）：只用 `inject: ['webServer','connection']` 两个硬依赖，
  * 文件系统走 node:fs —— `ctx.fs` 与 workspaceFiles 一样不暴露 mtime。
@@ -26,9 +32,13 @@
  *      也会被挡住（纯字符串前缀比对比不了这一层）。
  */
 
-import { createReadStream } from 'node:fs'
-import { readdir, realpath, stat, writeFile } from 'node:fs/promises'
-import { basename, extname, isAbsolute, join, parse as parsePath, resolve as resolvePath, sep } from 'node:path'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { lstat, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { basename, dirname, extname, isAbsolute, join, parse as parsePath, resolve as resolvePath, sep } from 'node:path'
+import { pipeline } from 'node:stream/promises'
+
+import { moveToTrash } from './lib/trash.js'
 
 /** loader 行标识。 */
 export const name = 'file-extras'
@@ -46,11 +56,16 @@ const CHANNEL = '/dsh-file-extras'
 /** 一次 stat 请求最多带多少个路径（文件树一屏几百行也够）。 */
 const MAX_PATHS_PER_REQUEST = 500
 
-/** 单次上传的字节上限（整个 body 会读进内存再落盘）。 */
-const MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+/**
+ * 单次上传的字节上限。
+ *
+ * 上传是**流式**落盘的（边收边写临时文件），所以这个数字不是内存约束，只是拦住失控请求；
+ * 给得足够宽，免得用户传个大包时撞上一个莫名其妙的墙。
+ */
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
 
-/** 单次下载的文件字节上限（浏览器侧走 Blob，超过就没意义了）。 */
-const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+/** 单条 RPC 请求体的上限（只有 JSON 信封，几百个路径也就几十 KB）。 */
+const MAX_RPC_BYTES = 32 * 1024 * 1024
 
 /** 目标目录里重名时最多试到第几号（`name (1).ext` … `name (999).ext`）。 */
 const MAX_RENAME_ATTEMPTS = 999
@@ -101,7 +116,7 @@ function queryOf(url) {
 }
 
 /**
- * 一次性读出请求体（带上限）。
+ * 一次性读出请求体（带上限）。只给 RPC 的 JSON 信封用 —— 上传走流式，不经过这里。
  * @param {import('node:http').IncomingMessage} request - 原始请求。
  * @param {number} limit - 允许的最大字节数。
  * @returns {Promise<Buffer>} 完整请求体。
@@ -112,7 +127,7 @@ async function readBody(request, limit) {
   for await (const chunk of request) {
     size += chunk.length
     if (size > limit) {
-      throw new FileExtrasError('file-extras/too-large', `上传内容超过上限 ${Math.round(limit / 1024 / 1024)} MiB`, { limit })
+      throw new FileExtrasError('file-extras/too-large', `请求体超过上限 ${Math.round(limit / 1024 / 1024)} MiB`, { limit })
     }
     chunks.push(chunk)
   }
@@ -187,6 +202,43 @@ class Confinement {
     }
     return real
   }
+
+  /**
+   * 删除专用的校验：按**目录项本身**判定包含关系，而不是跟随软链接之后的真实路径。
+   *
+   * `check()` 会 realpath，于是「工作区里一个指向区外的软链接」会被判成区外而拒绝删除 ——
+   * 可我们恰恰需要能删掉这种链接本身。这里改成解析**父目录**的 realpath 再拼上末段：
+   * 软链接作为目录项被判定（在区内），删除时也只删链接、不碰它指向的东西。
+   * @param {string} candidate - 绝对路径。
+   * @returns {Promise<string>} 可安全删除的绝对路径。
+   */
+  async checkEntry(candidate) {
+    if (this.realRoot === '') await this.open()
+    if (typeof candidate !== 'string' || candidate === '' || candidate.includes('\0')) {
+      throw new FileExtrasError('file-extras/bad-request', '路径非法')
+    }
+    if (!isAbsolute(candidate)) {
+      throw new FileExtrasError('file-extras/bad-request', `路径必须是绝对路径：${candidate}`)
+    }
+    const resolved = resolvePath(candidate)
+    // 先挡工作区根自己：它的「父目录」天然在区外，若走下面的父目录判定会被报成
+    // outside-workspace —— 意思对但说不清，这里给一个明确的 delete-root。
+    if (foldCase(resolved) === foldCase(this.realRoot)) {
+      throw new FileExtrasError('file-extras/delete-root', '拒绝对工作区根执行删除')
+    }
+    const parentReal = await realpath(dirname(resolved)).catch(() => undefined)
+    if (parentReal === undefined) {
+      throw new FileExtrasError('file-extras/not-found', `上级目录不存在：${resolved}`)
+    }
+    if (!isInside(this.realRoot, parentReal)) {
+      throw new FileExtrasError('file-extras/outside-workspace', `上级目录不在工作区内：${parentReal}`, { root: this.realRoot })
+    }
+    const entry = join(parentReal, basename(resolved))
+    if (!isInside(this.realRoot, entry)) {
+      throw new FileExtrasError('file-extras/outside-workspace', `路径不在工作区内：${entry}`, { root: this.realRoot })
+    }
+    return entry
+  }
 }
 
 /**
@@ -237,18 +289,22 @@ function asciiFallbackName(name) {
 
 /**
  * 错误码 → HTTP 状态码。
- *
  * 只给 **download / upload** 这两条裸路由用：它们是字节通道，浏览器侧按 `response.ok` 判成败，
  * 所以失败必须是真正的错误状态。RPC 端点相反 —— 信封失败也要回 200，因为
  * `ctx.connection.rpc.call` 把非 2xx 一律当**传输失败**抛异常，读不到信封里的错误码。
  */
 function statusForCode(code) {
   switch (code) {
-    case 'file-extras/outside-workspace': return 403
+    case 'file-extras/outside-workspace':
+    case 'file-extras/delete-root': return 403
     case 'file-extras/not-regular-file':
     case 'file-extras/not-a-directory':
     case 'file-extras/bad-request': return 400
-    case 'file-extras/name-conflict': return 409
+    case 'file-extras/name-conflict':
+    case 'file-extras/busy':
+    case 'file-extras/trash-failed': return 409
+    case 'file-extras/trash-unavailable': return 501
+    case 'file-extras/trash-timeout': return 504
     case 'file-extras/too-large': return 413
     case 'file-extras/not-found': return 404
     default: return 500
@@ -318,11 +374,120 @@ export function apply(ctx) {
       }))
       return { root, entries }
     },
+
+    /**
+     * 删除若干路径。
+     *
+     * payload: { root: string, paths: string[], permanent?: boolean }
+     * value:   { removed, mode: 'trash' | 'permanent', results: [{ path, ok, type?, mode?, error?, message? }] }
+     *
+     * 默认（`permanent !== true`）走**回收站**，可还原；`permanent: true` 才走 `fs.rm`，
+     * 永久且不可恢复 —— 浏览器侧用一个默认不勾的复选框把这两条路分开，
+     * **绝不静默降级**（回收站不可用时宁可报错，也不偷偷改成永久删除）。
+     *
+     * 回收站本身是跨平台的（见 `lib/trash.js`）：Windows 走 Shell 的 SHFileOperation，
+     * Linux 走 freedesktop Trash 规范，macOS 走 `~/.Trash`。三个平台都没有后端时
+     * 回 `file-extras/trash-unavailable`，由用户自己勾「永久删除」继续。
+     *
+     * 逐条独立结算：一批里有一个失败（被占用、权限不足、回收站拒收），其余照做，
+     * 失败原因按条回给浏览器侧拼成提示 —— 不做「一个失败整批回滚」，那既做不到也不符合用户预期。
+     *
+     * 安全：走 `checkEntry`（按目录项判定包含关系），所以
+     *   · 工作区外的路径一律拒绝；
+     *   · 工作区**根自己**拒绝删除（否则一行手滑就把整个工作区抹了）；
+     *   · 落在工作区内的软链接按「链接本身」处理，绝不跟随到区外。
+     */
+    async remove(payload) {
+      const rawPaths = payload?.paths
+      if (!Array.isArray(rawPaths) || rawPaths.length === 0) {
+        throw new FileExtrasError('file-extras/bad-request', 'paths 必须是非空数组')
+      }
+      if (rawPaths.length > MAX_PATHS_PER_REQUEST) {
+        throw new FileExtrasError('file-extras/bad-request', `一次最多删除 ${MAX_PATHS_PER_REQUEST} 项`)
+      }
+      const confinement = new Confinement(payload?.root)
+      const root = await confinement.open()
+      const permanent = payload?.permanent === true
+      /** 与 rawPaths 一一对应的结果槽；先占位，保证返回顺序就是请求顺序。 */
+      const outcomes = new Array(rawPaths.length).fill(undefined)
+      /** 待送回收站的项：{ slot, path（客户端原样路径）, real（真实路径）, kind }。 */
+      const queued = []
+
+      /** 把异常翻译成逐条结果；`lib/trash.js` 抛的错自带 `file-extras/*` code，照样透传。 */
+      const failureOf = (path, cause) => {
+        const code = cause instanceof FileExtrasError
+          ? cause.code
+          : (typeof cause?.code === 'string' && cause.code.startsWith('file-extras/')
+            ? cause.code
+            : (cause?.code === 'ENOENT' ? 'file-extras/not-found'
+              : (cause?.code === 'EPERM' || cause?.code === 'EBUSY' || cause?.code === 'EACCES' ? 'file-extras/busy' : 'file-extras/internal')))
+        return { path, ok: false, error: code, message: messageOf(cause) }
+      }
+
+      for (let slot = 0; slot < rawPaths.length; slot += 1) {
+        const path = rawPaths[slot]
+        if (typeof path !== 'string' || path === '') {
+          outcomes[slot] = { path: String(path), ok: false, error: 'file-extras/bad-request', message: '路径非法' }
+          continue
+        }
+        let entry
+        let info
+        try {
+          entry = await confinement.checkEntry(path)
+          if (foldCase(entry) === foldCase(root)) {
+            throw new FileExtrasError('file-extras/delete-root', '拒绝对工作区根执行删除')
+          }
+          info = await lstat(entry)
+        } catch (cause) {
+          outcomes[slot] = failureOf(path, cause)
+          continue
+        }
+        const link = info.isSymbolicLink()
+        if (permanent) {
+          try {
+            // recursive 对文件/软链接就是 unlink，对真目录才是递归；Node 内部按 lstat 判定，
+            // 所以穿过软链接递归删目标这种事不会发生。
+            await rm(entry, { recursive: true, force: false })
+            outcomes[slot] = { path, ok: true, type: link ? 'link' : (info.isDirectory() ? 'directory' : 'file'), mode: 'permanent' }
+          } catch (cause) {
+            outcomes[slot] = failureOf(path, cause)
+          }
+          continue
+        }
+        queued.push({ slot, path, real: entry, kind: link ? 'link' : (info.isDirectory() ? 'directory' : 'file') })
+      }
+
+      if (queued.length > 0) {
+        let answers
+        try {
+          answers = await moveToTrash(queued.map((item) => ({ path: item.real, kind: item.kind })), { cwd: root })
+        } catch (cause) {
+          // 回收站整体不可用：这一批全部按失败回报，绝不退化成永久删除。
+          for (const item of queued) outcomes[item.slot] = failureOf(item.path, cause)
+          answers = new Map()
+        }
+        for (const item of queued) {
+          if (outcomes[item.slot] !== undefined) continue
+          const answer = answers.get(item.real)
+          outcomes[item.slot] = answer === undefined
+            ? { path: item.path, ok: false, error: 'file-extras/trash-failed', message: '回收站没有回报这一项的结果' }
+            : (answer.ok
+              ? { path: item.path, ok: true, type: item.kind, mode: answer.mode ?? 'trash' }
+              : { path: item.path, ok: false, error: 'file-extras/trash-failed', message: answer.message ?? '移到回收站失败' })
+        }
+      }
+
+      const results = outcomes.filter((item) => item !== undefined)
+      return { removed: results.filter((item) => item.ok === true).length, mode: permanent ? 'permanent' : 'trash', results }
+    },
   }
 
   /**
    * GET <CHANNEL>/download?root=…&path=…
-   * 直接流式回文件字节，不经过 RPC（JSON 里塞 base64 会白白放大 33%）。
+   *
+   * 流式回文件字节，不经过 RPC（JSON 里塞 base64 会白白放大 33%），也**不设大小上限**：
+   * 字节从磁盘直接进 socket，host 侧内存占用与文件大小无关，客户端那边是浏览器的原生下载
+   * （同样不经过页面内存）。上限只会变成用户传大文件时的一道莫名其妙的墙。
    */
   async function handleDownload(request, response, url) {
     const query = queryOf(url)
@@ -332,9 +497,6 @@ export function apply(ctx) {
     const info = await stat(real)
     if (!info.isFile()) {
       throw new FileExtrasError('file-extras/not-regular-file', `不是普通文件：${real}`)
-    }
-    if (info.size > MAX_DOWNLOAD_BYTES) {
-      throw new FileExtrasError('file-extras/too-large', `文件超过下载上限 ${Math.round(MAX_DOWNLOAD_BYTES / 1024 / 1024)} MiB`, { size: info.size })
     }
     const filename = basename(real)
     response.writeHead(200, {
@@ -355,6 +517,13 @@ export function apply(ctx) {
   /**
    * POST <CHANNEL>/upload?root=…&dir=…&name=…（body = 原始字节）
    * 写成功回 { ok: true, value: { path, name, size, renamed } }。
+   *
+   * 边收边写，**不把整个文件读进内存**：
+   *   1. 先用 content-length 挡掉明显超限的请求（浏览器传 File 一定会带这个头）；
+   *   2. 写同目录下的 `.part-<uuid>` 临时文件，收完再 rename 成目标名 ——
+   *      rename 在同卷上是原子的，所以中途失败/超限不会在工作区留下半个「看起来正常」的文件，
+   *      文件树的 watcher 也不会把一个还在长的文件当成成品列出来；
+   *   3. 流式计数作为兜底上限（content-length 可以撒谎）。
    */
   async function handleUpload(request, response, url) {
     const query = queryOf(url)
@@ -365,18 +534,41 @@ export function apply(ctx) {
     if (!directoryInfo.isDirectory()) {
       throw new FileExtrasError('file-extras/not-a-directory', `上传目标不是目录：${directory}`)
     }
+    const declared = Number(request.headers['content-length'])
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+      throw new FileExtrasError('file-extras/too-large', `上传内容超过上限 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024)} GiB`, { limit: MAX_UPLOAD_BYTES })
+    }
     const wanted = safeFileName(query.name)
-    const buffer = await readBody(request, MAX_UPLOAD_BYTES)
     const finalName = await pickFreeName(directory, wanted)
     const target = join(directory, finalName)
     // 二次确认：拼出来的目标必须仍在工作区内（`pickFreeName` 只会加后缀，这里是兜底断言）。
     if (!isInside(confinement.realRoot, resolvePath(target))) {
       throw new FileExtrasError('file-extras/outside-workspace', `目标路径不在工作区内：${target}`)
     }
-    await writeFile(target, buffer)
+    const temporary = `${target}.part-${randomUUID()}`
+    let written = 0
+    try {
+      await pipeline(
+        request,
+        async function* count(source) {
+          for await (const chunk of source) {
+            written += chunk.length
+            if (written > MAX_UPLOAD_BYTES) {
+              throw new FileExtrasError('file-extras/too-large', `上传内容超过上限 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024)} GiB`, { limit: MAX_UPLOAD_BYTES })
+            }
+            yield chunk
+          }
+        },
+        createWriteStream(temporary),
+      )
+      await rename(temporary, target)
+    } catch (cause) {
+      await rm(temporary, { force: true }).catch(() => undefined)
+      throw cause
+    }
     return {
       ok: true,
-      value: { path: target, name: finalName, size: buffer.length, renamed: finalName !== wanted },
+      value: { path: target, name: finalName, size: written, renamed: finalName !== wanted },
     }
   }
 
@@ -442,7 +634,7 @@ export function apply(ctx) {
   async function handleRpc(request, fallbackMethod) {
     let message = null
     try {
-      const raw = await readBody(request, MAX_UPLOAD_BYTES)
+      const raw = await readBody(request, MAX_RPC_BYTES)
       message = raw.length === 0 ? null : JSON.parse(raw.toString('utf8'))
     } catch (cause) {
       return {
