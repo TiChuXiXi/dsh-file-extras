@@ -1,16 +1,36 @@
 # dsh-file-extras
 
-DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`@deepseek-ai/dsh-client-ui-sidebar-files`）上补三件事。
+DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`@deepseek-ai/dsh-client-ui-sidebar-files`）上补右键菜单、行内元数据、多选与删除。
 
 | 需求 | 现在的行为 |
 | --- | --- |
 | 覆盖默认浏览器右键菜单 | 在文件树内右键弹出自己的菜单（树外一律不接管，浏览器默认菜单照旧） |
-| 文件右键 | **下载** / **复制路径** / **删除** |
-| 文件夹右键 | **上传文件到此处…** / **复制路径** / **删除** |
+| 文件右键 | **下载** / **@ 到对话** / **复制路径** / **删除** |
+| 文件夹右键 | **上传文件到此处…** / **@ 到对话** / **复制路径** / **删除** |
 | 空白处右键 | **上传文件到此处…** / **复制路径** / **刷新大小与日期** / **全选可见项**（有选择时再加 **清除选择** 与 **删除 N 项**） |
 | 文件大小 + 修改日期 | 行尾显示 `1.2 KB · 2026-03-04 13:06:07`，按字节自动选单位（B/KB/MB/GB/TB/PB，1024 进制） |
 | 文件夹大小 + 修改日期 | 行尾显示 `3 项 · 2026-03-04 13:06:07`；**只数第一级子级**（`readdir` 一层，不递归） |
 | 删除（文件夹 / 单文件 / 多文件） | 走 **二次确认框**（列出每一项是什么、多大、文件夹含多少内容）；默认**移到回收站**（可还原），「永久删除」藏在默认不勾的复选框后面 |
+| @ 到对话（文件 / 文件夹） | 直接在当前对话的输入框里插一枚 `@` 引用芯片，和用户自己敲 `@` 选出来的是**同一种东西** |
+
+## @ 到对话
+
+右键文件或文件夹 → **@ 到对话**，该路径就以引用芯片的形式进入当前对话的输入框（多选时一次插一批）。
+**只插入、不发送** —— 后面还要接着写字，替你按发送键是越权。
+
+这里**没有**重新实现「对话里 @ 文件」：
+
+- 芯片交给官方会话自己的编辑器插（`ctx.conversation.input.for(actx).addFiles(...)`，
+  和把文件拖进输入框走的是**同一条路**），所以序列化（模型看到的文本）、点击芯片在右侧栏预览、
+  草稿持久化、发送时展开，全部沿用官方行为；
+- 提及文本逐字复刻官方 `@` 补全的语法（`@deepseek-ai/dsh-file-reference` 的 `formatFileMention`）：
+  `@src/index.ts`、目录 `@src/`、含空格 `@"my notes.txt"`、含空格的目录 `@"my docs/`（引号故意不闭合，官方语法如此）；
+- 路径按「相对会话工作区根 + 正斜杠」给（官方候选就是这个形式，模型也按这个解析）。
+  会话工作区与树根不一致时退回绝对路径，不硬拼一个错的相对路径。
+
+「当前对话」取 `ctx.sidebarRight.mounted` —— 官方对「主栏正在显示哪个会话」唯一的公开可观察量，
+文件树本身也是按这个会话渲染的。拿不到会话、会话没被 retain、输入框正忙（正在提交）时都**明确报错**，不静默失败。
+
 
 ## 多选怎么用
 
@@ -50,7 +70,7 @@ host 半区在 `ctx.webServer` 上挂一条前缀路由 `/dsh-file-extras`：
 | --- | --- |
 | [index.js](index.js) | host 半区：`/dsh-file-extras` 前缀路由 —— RPC `stat`（大小 / mtime / 一级子项数）、`remove`、`GET download`、`POST upload` |
 | [lib/trash.js](lib/trash.js) | 跨平台「移入回收站」：Windows / Linux / macOS 三套后端；平台与家目录可注入，所以三套逻辑能在任意一台机器上实测 |
-| [lib/client.js](lib/client.js) | 浏览器半区：行内元数据 + 多选 + 右键菜单 + 删除确认框（注册进 `shell.overlay`） |
+| [lib/client.js](lib/client.js) | 浏览器半区：行内元数据 + 多选 + 右键菜单 + 删除确认框 + @ 到对话（注册进 `shell.overlay`） |
 | [cordis.patch.yml](cordis.patch.yml) | loader 行（`inject: [webServer, connection]`） |
 | [package.json](package.json) | `dsh.bundle` + `dsh.client` |
 | [scripts/selftest.mjs](scripts/selftest.mjs) / [scripts/dom-probe.mjs](scripts/dom-probe.mjs) / [scripts/trash-bin.mjs](scripts/trash-bin.mjs) | 两层自检 + 回收站测试清理助手 |
@@ -103,6 +123,11 @@ dsh plugin --profile web add dsh-file-extras
   还要吃掉同等内存、最后再从内存写一遍盘。现在改成 `stat` 预检（毫秒级，失败能说清原因）+
   `<a download>` 原生导航（字节由 host 直接流到磁盘，立即开始、内存零拷贝、无大小上限）。
   上传同理：进度提示在传输开始前就弹出来，host 侧边收边写。
+- **「@ 到对话」用的是官方输入框，不是自建通道**。芯片由会话自己的 Lexical 编辑器插
+  （`ctx.conversation.input.for(actx).addFiles(refs, [])`），本插件只做两件事：
+  从文件树里认出用户点了哪个路径、拼出和官方 `@` 补全逐字一致的提及文本。
+  提及语法（引号规则、目录尾斜杠）是 `formatFileMention` 的复刻 —— 改它之前先对照
+  `@deepseek-ai/dsh-file-reference` 的 grammar，**一个字都不能差**：差一个引号，模型就会把带空格的路径拆成两段。
 - **回收站不是文件系统特性，是 Shell 特性**。`fs.rm` / `unlink` / `rmdir` 落到内核的删除原语，
   删掉就是删掉；真正「移入回收站」的在 Windows 上是 `SHFileOperation`（要在
   `<卷>:\$Recycle.Bin\<SID>\` 下写一对 `$I`（元数据）+ `$R`（数据）文件并登记进用户回收站索引，
@@ -116,7 +141,7 @@ dsh plugin --profile web add dsh-file-extras
 
 ```powershell
 node scripts/selftest.mjs                  # host 半区：假 ctx/req/res 驱动路由，35 个用例（真文件系统 + 三套回收站后端）
-node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，58 条断言
+node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，70 条断言
 node scripts/dom-probe.mjs --shot out/     # 同上，另存浅色（多选+菜单）与深色（删除确认框）两张截图
 ```
 
@@ -145,6 +170,10 @@ npm install --prefix .npm-cache/domprobe --cache .npm-cache --registry=https://r
 - 增强落在官方树的 DOM 契约上（`data-files-state` / `data-files-root` / `data-files-entry` /
   `data-files-path` / `data-files-body` / `data-files-reload`）。这些属性是官方组件有意暴露的钩子，
   但如果上游改名，本插件会**静默失效**（找不到树就什么都不做，不会报错也不会弄坏页面）。
+- **「@ 到对话」比其余功能多依赖三个客户端服务**（`conversation` / `sessions` / `sidebarRight`），
+  而这三个没有声明在 `dsh.client.inject` 里 —— 刻意如此：它们是**点击那一刻**才去 `ctx.get()` 的，
+  缺一个只会让这一项报错，不会让整个插件（元数据、菜单、删除）起不来。
+  上游若改了 `input.for()` / `addFiles()` 的形状，这里也会**明确报错**而不是静默插入失败。
 - 元数据每 15 秒后台重取一次（仅页面可见时）。文件在会话里被反复改写、行节点又被 React 复用，
   不重取就会一直显示旧值。
 - 「刷新」按的是官方的重载按钮（`data-files-reload`），不自己维护目录状态。

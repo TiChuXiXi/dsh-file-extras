@@ -71,6 +71,9 @@ const ENTRIES = {
   [`${FIXTURE_ROOT}\\sub\\a.txt`]: { type: 'file', size: 999, mtimeMs: RECENT },
   [`${FIXTURE_ROOT}\\sub\\pipe`]: { type: 'other', mtimeMs: RECENT },
   [`${FIXTURE_ROOT}\\sub\\a-very-long-file-name-to-force-ellipsis.txt`]: { type: 'file', size: 2048, mtimeMs: RECENT },
+  // 带空格的路径：`@` 语法要用引号包起来（`@"my notes.txt"`），是「@ 到对话」最容易写错的一支。
+  [`${FIXTURE_ROOT}\\my notes.txt`]: { type: 'file', size: 77, mtimeMs: RECENT },
+  [`${FIXTURE_ROOT}\\with space`]: { type: 'directory', childCount: 0, mtimeMs: RECENT },
 }
 
 const pad2 = (value) => (value < 10 ? `0${value}` : String(value))
@@ -90,14 +93,17 @@ const EXPECTED_META = {
   [`${FIXTURE_ROOT}\\sub`]: `3 项 · ${expectDate(RECENT)}`,
   [`${FIXTURE_ROOT}\\sub\\a.txt`]: `999 B · ${expectDate(RECENT)}`,
   [`${FIXTURE_ROOT}\\sub\\a-very-long-file-name-to-force-ellipsis.txt`]: `2.0 KB · ${expectDate(RECENT)}`,
+  [`${FIXTURE_ROOT}\\my notes.txt`]: `77 B · ${expectDate(RECENT)}`,
+  [`${FIXTURE_ROOT}\\with space`]: `0 项 · ${expectDate(RECENT)}`,
 }
 
 /* ------------------------------------------------------------------ 页面 */
 
 /** 照抄官方 sidebar-files 的 DOM 契约 + 关键布局 CSS（类名换成 fx-，规则逐条对应）。 */
 function buildHtml() {
-  const row = (kind, path, name) => kind === 'directory'
-    ? `<li data-files-entry="directory" data-files-path="${path}"><button class="fx-row" aria-expanded="true"><svg class="fx-icon" width="16" height="16"></svg><span class="fx-name">${name}</span></button><ul class="fx-level">${NESTED}</ul></li>`
+  // 注意：默认值不能写成参数默认值 —— 第一次调用发生在 NESTED 自己的初始化里，会踩 TDZ。
+  const row = (kind, path, name, nested) => kind === 'directory'
+    ? `<li data-files-entry="directory" data-files-path="${path}"><button class="fx-row" aria-expanded="true"><svg class="fx-icon" width="16" height="16"></svg><span class="fx-name">${name}</span></button><ul class="fx-level">${nested ?? NESTED}</ul></li>`
     : kind === 'other'
       ? `<li data-files-entry="other" data-files-path="${path}"><span class="fx-row fx-other" aria-disabled="true" title="其他"><span class="fx-name">${name}</span></span></li>`
       : `<li data-files-entry="file" data-files-path="${path}"><button class="fx-row"><svg class="fx-icon" width="16" height="16"></svg><span class="fx-name">${name}</span></button></li>`
@@ -115,6 +121,8 @@ function buildHtml() {
     row('file', `${FIXTURE_ROOT}\\empty.txt`, 'empty.txt'),
     row('file', `${FIXTURE_ROOT}\\old.txt`, 'old.txt'),
     row('file', `${FIXTURE_ROOT}\\missing.txt`, 'missing.txt'),
+    row('file', `${FIXTURE_ROOT}\\my notes.txt`, 'my notes.txt'),
+    row('directory', `${FIXTURE_ROOT}\\with space`, 'with space', ''),
   ].join('')
 
   return `<!doctype html><html><head><meta charset="utf-8">
@@ -220,6 +228,38 @@ const callChannel = async (channel, endpoint, payload) => {
   return { ok: true, value: { root: payload.root, entries } }
 }
 
+/* —— 会话服务的假件：「@ 到对话」走的是官方 conversation/sessions/sidebarRight 服务，
+      不是本插件的 host 通道，所以这里必须把这三个服务摆出来，才能量到真插进去的引用。 —— */
+window.__mentions = []
+window.__mentionFocus = 0
+window.__forCalls = []
+/** 当前「屏幕上的会话」；置成 null 就能量「没有打开的对话」那条路。 */
+window.__mountedSession = 'sess-1'
+/** 会话列表里那份 cwd；置成别的值就能量「树根 ≠ 会话工作区」的兜底。 */
+window.__sessionCwd = window.__fixtureRoot
+
+const fakeInput = {
+  addFiles: (references, ids) => {
+    window.__mentions.push({ references, ids })
+    return window.__mentionBusy !== true
+  },
+  focus: () => { window.__mentionFocus += 1 },
+}
+const fakeActx = { __scope: 'sess-1' }
+const fakeSessions = {
+  list: { getSnapshot: () => ({ byId: { 'sess-1': { cwd: window.__sessionCwd } } }) },
+  scope: (id) => (id === 'sess-1' ? fakeActx : undefined),
+}
+const fakeConversation = {
+  input: { for: (actx) => { window.__forCalls.push(actx); return fakeInput } },
+}
+const fakeSidebarRight = { mounted: { getSnapshot: () => window.__mountedSession } }
+const fakeServices = {
+  conversation: fakeConversation,
+  sessions: fakeSessions,
+  sidebarRight: fakeSidebarRight,
+}
+
 /* —— 挂上真正的客户端半区 —— */
 const half = window.__entry.factory((name) => {
   if (name === 'react') return window.React
@@ -233,6 +273,7 @@ half.apply({
     register: (spec, component) => { registered[spec.id] = component; return () => {} },
   },
   connection: { rpc: { call: callChannel } },
+  get: (name) => fakeServices[name],
 })
 if (registered['dsh-file-extras-menu'] === undefined) {
   return { error: 'shell.overlay 上没注册到 dsh-file-extras-menu，注册到的是：' + Object.keys(registered).join(',') }
@@ -798,12 +839,115 @@ panel.style.width = '340px'
 await wait(400)
 result.wideAgain = { flag: root.hasAttribute('data-fx-narrow') }
 
-/* ================= 8. 卸载还原 ================= */
+/* ================= 8. @ 到对话：复用官方引用芯片，不自己实现 ================= */
+// 先收干净（确认框 → 菜单 → 选择）
+await escape()
+await escape()
+await escape()
+window.__mentions.length = 0
+window.__mentionFocus = 0
+window.__forCalls.length = 0
+window.__mentionBusy = false
+window.__mountedSession = 'sess-1'
+window.__sessionCwd = window.__fixtureRoot
+const mentionRow = (relative) => rowFor(window.__fixtureRoot + '\\\\' + relative).firstElementChild
+/** 点「@ 到对话」并把这一轮插进去的引用取出来（深拷贝，免得后面被清空）。 */
+const runMention = async (label) => {
+  window.__mentions.length = 0
+  window.__mentionFocus = 0
+  window.__forCalls.length = 0
+  const clicked = await clickMenuItem(label)
+  return {
+    clicked,
+    mentions: JSON.parse(JSON.stringify(window.__mentions)),
+    focus: window.__mentionFocus,
+    // 记下插件交给官方 input.for(actx) 的那个 context：必须是 sessions.scope 借出来的同一个。
+    forScopes: window.__forCalls.map((actx) => actx?.__scope ?? null),
+    toast: toastText(),
+    menuClosed: menuNode() === null,
+  }
+}
+
+// 8a. 文件行
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+result.mentionFileMenu = { labels: menuLabels().filter((label) => label !== '') }
+result.mentionFile = await runMention('@ 到对话')
+
+// 8b. 目录行：目录的提及以斜杠结尾（官方语法，模型据此知道这是目录）
+rightClick(mentionRow('sub'), 120, 120)
+await wait(150)
+result.mentionDirMenu = { labels: menuLabels().filter((label) => label !== '') }
+result.mentionDir = await runMention('@ 到对话')
+
+// 8c. 带空格的路径：必须走引号语法，否则模型会把空格当分隔符
+rightClick(mentionRow('my notes.txt'), 120, 200)
+await wait(150)
+result.mentionQuoted = await runMention('@ 到对话')
+
+// 8d. 带空格的目录：引号故意不闭合 + 结尾带斜杠（与官方目录候选逐字一致）
+rightClick(mentionRow('with space'), 120, 260)
+await wait(150)
+result.mentionQuotedDir = await runMention('@ 到对话')
+
+// 8e. 多选：一次插一批芯片
+await escape()
+await escape()
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+rowClick(mentionRow('big.bin'), { ctrlKey: true })
+await wait(150)
+rightClick(mentionRow('big.bin'), 120, 240)
+await wait(150)
+result.mentionMultiMenu = { labels: menuLabels().filter((label) => label !== '') }
+result.mentionMulti = await runMention('@ 到对话（2 项）')
+
+// 8f. 没有打开的对话：必须说清楚，且一个芯片都不许插
+await escape()
+await escape()
+window.__mountedSession = null
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+result.mentionNoSession = await runMention('@ 到对话')
+
+// 8g. 会话没被 retain：同样不许插
+window.__mountedSession = 'sess-1'
+window.__sessionCwd = window.__fixtureRoot
+const realScope = fakeSessions.scope
+fakeSessions.scope = () => undefined
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+result.mentionNoScope = await runMention('@ 到对话')
+fakeSessions.scope = realScope
+
+// 8h. 输入框正忙（正在提交）：官方 addFiles 会返回 false，我们要说清而不是静默
+window.__mentionBusy = true
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+result.mentionBusy = await runMention('@ 到对话')
+window.__mentionBusy = false
+
+// 8i. 会话工作区与树根不一致：退回绝对路径（正斜杠），不硬拼出一个错的相对路径
+window.__sessionCwd = 'D:\\\\elsewhere'
+rightClick(mentionRow('alpha.txt'), 120, 200)
+await wait(150)
+result.mentionForeignCwd = await runMention('@ 到对话')
+window.__sessionCwd = window.__fixtureRoot
+
+/* ================= 9. 卸载还原 ================= */
 result.finalErrors = window.__errors
 return result
 `
 
 /* ------------------------------------------------------------------ CDP / 运行 */
+
+// 页面探针是一整个模板字面量：探针体里只要混进一个反引号（注释里写 `x` 也算），
+// 字面量就会被提前截断，`pageScript` 静默变成 `串 / 串 / 串` = NaN，
+// 求值出来是 undefined —— 表现成「探针没有返回值」，极难反查。这里当场拦下。
+if (typeof pageScript !== 'string') {
+  console.error(`dom-probe.mjs 的页面探针不是字符串（${typeof pageScript}）—— 探针体里混进了反引号，先把它清掉。`)
+  process.exit(1)
+}
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 
@@ -884,7 +1028,10 @@ async function run() {
     if (ready === false) return { error: `页面没有解析完：readyState/harness 未就绪` }
 
     const evaluation = client.send('Runtime.evaluate', {
-      expression: `(async () => { try { ${pageScript} } catch (cause) { return { error: String((cause && cause.stack) || cause) } } })()`,
+      // `window.__probe` 是「探针到底跑到哪一步」的存根：表达式一进去就写 running，
+      // 正常结束写 ok，抛错写 error。读回来是 undefined 就说明页面被导航掉了 ——
+      // 那是完全不同的病因，不能和「探针抛错」混为一谈。
+      expression: `window.__probe = { state: 'running' }; (async () => { try { const value = await (async () => { ${pageScript} })(); window.__probe = { state: 'ok', value }; return value } catch (cause) { window.__probe = { state: 'error', message: String((cause && cause.stack) || cause) }; return window.__probe } })()`,
       awaitPromise: true,
       returnByValue: true,
     })
@@ -921,8 +1068,14 @@ async function run() {
     const evaluationResult = await evaluation
     const value = evaluationResult?.result?.value
     if (value === undefined) {
-      const detail = evaluationResult?.exceptionDetails
-      return { error: `探针没有返回值：${JSON.stringify(detail ?? evaluationResult).slice(0, 500)}` }
+      // 页面里的错误要一起捞出来：只报「没有返回值」的话，根本不知道探针死在哪一步。
+      const pageErrors = await client
+        .send('Runtime.evaluate', { expression: 'JSON.stringify({ probe: window.__probe ?? null, errors: window.__errors ?? null, href: location.href, rows: document.querySelectorAll("[data-files-entry]").length })', returnByValue: true })
+        .catch(() => null)
+      return {
+        error: `探针没有返回值：${JSON.stringify(evaluationResult).slice(0, 800)}`
+          + ` | 页面错误：${String(pageErrors?.result?.value ?? '读不到').slice(0, 800)}`,
+      }
     }
 
     if (SHOT_DIR !== null) {
@@ -1022,11 +1175,11 @@ if (result.error !== undefined) {
     longName === undefined ? '没找到长名字那一行' : (longName.nameWidth < longName.rowWidth ? undefined : `名字宽 ${longName.nameWidth} / 行宽 ${longName.rowWidth}`))
 
   ok('文件右键：浏览器默认菜单被接管', result.fileRightClick.defaultPrevented === true ? undefined : JSON.stringify(result.fileRightClick))
-  ok('文件右键菜单项 = 下载 / 复制路径 / 删除',
-    JSON.stringify(result.fileMenu.labels) === JSON.stringify(['下载', '复制路径', '删除']) ? undefined : JSON.stringify(result.fileMenu.labels))
+  ok('文件右键菜单项 = 下载 / @ 到对话 / 复制路径 / 删除',
+    JSON.stringify(result.fileMenu.labels) === JSON.stringify(['下载', '@ 到对话', '复制路径', '删除']) ? undefined : JSON.stringify(result.fileMenu.labels))
   ok('文件右键菜单标题 = 文件名', result.fileMenu.title === 'alpha.txt' ? undefined : JSON.stringify(result.fileMenu.title))
-  ok('目录右键菜单项 = 上传文件到此处… / 复制路径 / 删除',
-    JSON.stringify(result.dirMenu.labels) === JSON.stringify(['上传文件到此处…', '复制路径', '删除']) ? undefined : JSON.stringify(result.dirMenu.labels))
+  ok('目录右键菜单项 = 上传文件到此处… / @ 到对话 / 复制路径 / 删除',
+    JSON.stringify(result.dirMenu.labels) === JSON.stringify(['上传文件到此处…', '@ 到对话', '复制路径', '删除']) ? undefined : JSON.stringify(result.dirMenu.labels))
   // 上一步右键过目录行，那一行因此被选中 —— 空白菜单于是带上选择相关的两项。
   ok('空白右键菜单项 = 上传 / 复制路径 / 刷新 / 全选，且有选择时追加清除与删除',
     JSON.stringify(result.blankMenu.labels) === JSON.stringify([
@@ -1064,13 +1217,13 @@ if (result.error !== undefined) {
       : JSON.stringify(result.shiftClick))
   ok('右键已选中的行：菜单作用整个选择（标题=已选 N 项、复制带数量、免掉单文件的下载/上传）',
     result.multiMenu.title === '已选 2 项'
-      && JSON.stringify(result.multiMenu.labels) === JSON.stringify(['复制 2 个路径', '删除 2 项'])
+      && JSON.stringify(result.multiMenu.labels) === JSON.stringify(['@ 到对话（2 项）', '复制 2 个路径', '删除 2 项'])
       && result.multiMenu.separators === 1
       ? undefined
       : JSON.stringify(result.multiMenu))
   ok('右键没选中的行：选择换成这一行，菜单回到单项形态',
     result.singleMenu.before.length === 1 && result.singleMenu.selected.length === 1
-      && JSON.stringify(result.singleMenu.labels) === JSON.stringify(['下载', '复制路径', '删除'])
+      && JSON.stringify(result.singleMenu.labels) === JSON.stringify(['下载', '@ 到对话', '复制路径', '删除'])
       ? undefined
       : JSON.stringify(result.singleMenu))
   ok('Esc 分层收：先收菜单（选择还在），再收选择',
@@ -1080,7 +1233,7 @@ if (result.error !== undefined) {
       : JSON.stringify(result.escapeLayers))
 
   /* ---- 删除 ---- */
-  ok('多选后删除项写明数量', JSON.stringify(result.deleteMenu.labels) === JSON.stringify(['复制 2 个路径', '删除 2 项'])
+  ok('多选后删除项写明数量', JSON.stringify(result.deleteMenu.labels) === JSON.stringify(['@ 到对话（2 项）', '复制 2 个路径', '删除 2 项'])
     ? undefined : JSON.stringify(result.deleteMenu.labels))
   ok('删除先弹二次确认，且此刻一次 remove 都没发',
     result.confirmShown.dialog === true && result.confirmShown.removedCalls === 0
@@ -1153,7 +1306,7 @@ if (result.error !== undefined) {
     ])
       ? undefined
       : JSON.stringify(result.blankMenuWithSelection.labels))
-  ok('全选可见项：选中整棵树当前可见的 9 行', result.selectAll === 9 ? undefined : String(result.selectAll))
+  ok('全选可见项：选中整棵树当前可见的 11 行', result.selectAll === 11 ? undefined : String(result.selectAll))
   ok('点菜单外关菜单', result.outsideClickClosed === true ? undefined : String(result.outsideClickClosed))
   ok('菜单位置夹回视口（右下角右键不溢出）',
     result.clamp !== null && result.clamp.overflowRight === false && result.clamp.overflowBottom === false
@@ -1236,6 +1389,86 @@ if (result.error !== undefined) {
       : JSON.stringify(narrowRowsWithMeta.map((row) => [row.path, row.rowHeight, row.nameHeight])))
   ok('拖宽后自动切回单行模式',
     result.wideAgain.flag === false ? undefined : JSON.stringify(result.wideAgain))
+
+  /* ---- @ 到对话 ---- */
+  /** 从 runMention 的结果里取出唯一一条引用（没有就是失败）。 */
+  const onlyReference = (run) => (run.mentions.length === 1 ? run.mentions[0].references[0] : undefined)
+  ok('文件行的「@ 到对话」插进官方输入框：source=reference / 提及文本 / 显示名 / 文件图标 / 剪贴板形态',
+    JSON.stringify(onlyReference(result.mentionFile)) === JSON.stringify({
+      source: 'reference',
+      ref: '@alpha.txt',
+      label: 'alpha.txt',
+      appearance: 'file',
+      clipboardText: '@alpha.txt',
+    })
+      ? undefined
+      : JSON.stringify(result.mentionFile))
+  ok('@ 到对话只插引用、不带附件，且插完把焦点交回输入框',
+    result.mentionFile.mentions[0]?.ids.length === 0 && result.mentionFile.focus === 1
+      ? undefined
+      : JSON.stringify({ ids: result.mentionFile.mentions[0]?.ids, focus: result.mentionFile.focus }))
+  ok('@ 到对话弹成功提示（不是静默插进去）',
+    result.mentionFile.toast === '已 @ alpha.txt 到对话' ? undefined : JSON.stringify(result.mentionFile.toast))
+  ok('@ 到对话复用会话作用域：交给官方 input.for 的正是 sessions.scope 借出来的那个 context',
+    JSON.stringify(result.mentionFile.forScopes) === JSON.stringify(['sess-1'])
+      && result.mentionFileMenu.labels.includes('@ 到对话')
+      ? undefined
+      : JSON.stringify({ forScopes: result.mentionFile.forScopes, labels: result.mentionFileMenu.labels }))
+  ok('目录行的「@ 到对话」：提及以 / 结尾、显示名带 /、图标是文件夹（官方目录语法）',
+    JSON.stringify(onlyReference(result.mentionDir)) === JSON.stringify({
+      source: 'reference',
+      ref: '@sub/',
+      label: 'sub/',
+      appearance: 'folder',
+      clipboardText: '@sub/',
+    })
+      ? undefined
+      : JSON.stringify(result.mentionDir))
+  ok('带空格的路径自动加引号（@"my notes.txt"），不会让模型把空格当分隔符',
+    JSON.stringify(onlyReference(result.mentionQuoted)) === JSON.stringify({
+      source: 'reference',
+      ref: '@"my notes.txt"',
+      label: 'my notes.txt',
+      appearance: 'file',
+      clipboardText: '@"my notes.txt"',
+    })
+      ? undefined
+      : JSON.stringify(result.mentionQuoted))
+  ok('带空格的目录：引号故意不闭合且结尾带 /（与官方目录候选逐字一致）',
+    JSON.stringify(onlyReference(result.mentionQuotedDir)) === JSON.stringify({
+      source: 'reference',
+      ref: '@"with space/',
+      label: 'with space/',
+      appearance: 'folder',
+      clipboardText: '@"with space/',
+    })
+      ? undefined
+      : JSON.stringify(result.mentionQuotedDir))
+  ok('多选时一次插一批芯片（两个文件两条引用，按菜单文案写数量）',
+    result.mentionMulti.mentions.length === 1
+      && result.mentionMulti.mentions[0].references.length === 2
+      && JSON.stringify(result.mentionMulti.mentions[0].references.map((ref) => ref.ref)) === JSON.stringify(['@alpha.txt', '@big.bin'])
+      && result.mentionMulti.toast === '已 @ 2 项到对话'
+      && result.mentionMultiMenu.labels.includes('@ 到对话（2 项）')
+      ? undefined
+      : JSON.stringify(result.mentionMulti))
+  ok('没有打开的对话时：不插任何芯片，并说清原因',
+    result.mentionNoSession.mentions.length === 0 && result.mentionNoSession.toast === '当前没有打开的对话，无法 @ 到对话'
+      ? undefined
+      : JSON.stringify(result.mentionNoSession))
+  ok('会话没被 retain 时：同样不插，并说清原因',
+    result.mentionNoScope.mentions.length === 0 && result.mentionNoScope.toast === '当前对话尚未就绪，无法 @ 到对话'
+      ? undefined
+      : JSON.stringify(result.mentionNoScope))
+  ok('输入框正忙（正在提交）时：不假装成功，提示稍后再试',
+    result.mentionBusy.mentions.length === 1 && result.mentionBusy.mentions[0].references.length === 1
+      && result.mentionBusy.toast === '输入框正忙（正在提交），稍后再试'
+      ? undefined
+      : JSON.stringify(result.mentionBusy))
+  ok('会话工作区与树根不一致时退回绝对路径（正斜杠），不硬拼一个错的相对路径',
+    JSON.stringify(onlyReference(result.mentionForeignCwd)?.ref) === JSON.stringify('@D:/fixture/alpha.txt')
+      ? undefined
+      : JSON.stringify(result.mentionForeignCwd))
 }
 
 console.log(lines.join('\n'))

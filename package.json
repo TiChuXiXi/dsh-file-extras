@@ -1,7 +1,7 @@
 {
   "name": "dsh-file-extras",
-  "version": "0.1.0",
-  "description": "DSH Web GUI 的工作区文件树增强：行内显示大小与修改日期，右键菜单提供下载 / 上传 / 复制路径。",
+  "version": "0.2.0",
+  "description": "DSH Web GUI 的工作区文件树增强：行内显示大小与修改日期，右键菜单提供下载 / 上传 / @ 到对话 / 复制路径 / 删除（走回收站，跨平台）。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -37,6 +37,7 @@
     "plugin",
     "file-manager",
     "context-menu",
+    "file-mention",
     "web-ui"
   ],
   "license": "MIT",
