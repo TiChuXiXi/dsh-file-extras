@@ -6,6 +6,8 @@
  *   · 工作区包含判定（区外路径、`..` 穿越、软链接逃逸都要被拒）；
  *   · 上传的原始字节落盘 + 重名自动加序号（绝不覆盖）；
  *   · 下载的 Content-Disposition / Content-Length / 字节一致性；
+ *   · history 只回真实用户指令（系统注入的 user/message 必须被挡住）；
+ *   · 文件驱动的斜杠命令：frontmatter / $ARGUMENTS / 重名跳过；
  *   · RPC 信封（rpcId 回显、失败码）。
  *
  * 跑法：node scripts/selftest.mjs
@@ -19,6 +21,7 @@ import { join } from 'node:path'
 import { Writable } from 'node:stream'
 
 import { apply } from '../index.js'
+import { buildPrompt, commandNameFromFile, discoverCommandFiles, parseCommandFile, renderPrompt } from '../lib/commands-md.js'
 import { moveToTrash } from '../lib/trash.js'
 import { addedTrashEntries, purgeTrash, snapshotTrash } from './trash-bin.mjs'
 
@@ -26,8 +29,31 @@ const CHANNEL = '/dsh-file-extras'
 
 /* ------------------------------------------------------------ 假 ctx / req / res */
 
+/**
+ * 命令目录走 `$DSH_HOME`：自检**不碰**用户真实的 `~/.dsh/commands`。
+ * 必须在 apply() 之前设好 —— 插件启动时就会扫一遍目录。
+ */
+const fakeDshHome = await mkdtemp(join(tmpdir(), 'dsh-fx-home-'))
+const fakeCommandDir = join(fakeDshHome, 'commands')
+await mkdir(fakeCommandDir, { recursive: true })
+await writeFile(join(fakeCommandDir, 'greet.md'), '---\ndescription: 打个招呼\ninput-hint: <名字>\n---\n\n你好，$ARGUMENTS\n')
+await writeFile(join(fakeCommandDir, 'plain.md'), '没有任何 frontmatter 的正文')
+await writeFile(join(fakeCommandDir, 'goal.md'), '与 app 级命令重名，必须被跳过')
+await writeFile(join(fakeCommandDir, 'Bad Name.md'), '文件名不合命令文法，必须被跳过')
+await writeFile(join(fakeCommandDir, 'notes.txt'), '不是 .md，必须被跳过')
+process.env.DSH_HOME = fakeDshHome
+
 let routeHandler = null
 let rejection = undefined
+
+/** 假命令注册表：`goal` 先占位，用来验证重名只跳过这一条。 */
+const registered = new Map()
+registered.set('goal', { name: 'goal' })
+
+/** 假 sessionQuery：事件日志由用例按需填充。 */
+let sessionEvents = []
+let sessionQueryPresent = true
+let sessionQueryThrows = false
 
 apply({
   get(name) {
@@ -40,6 +66,26 @@ apply({
       }
     }
     if (name === 'connection') return { requestRejection: () => rejection }
+    if (name === 'commands') {
+      return {
+        register(definition) {
+          if (registered.has(definition.name)) {
+            throw new TypeError(`command name "${definition.name}" 已经被占用`)
+          }
+          registered.set(definition.name, definition)
+          return () => { registered.delete(definition.name) }
+        },
+      }
+    }
+    if (name === 'sessionQuery') {
+      if (!sessionQueryPresent) return undefined
+      return {
+        async readSession() {
+          if (sessionQueryThrows) throw new Error('会话日志读不了')
+          return { events: sessionEvents }
+        },
+      }
+    }
     return undefined
   },
   effect(setup) { return setup() },
@@ -130,6 +176,16 @@ async function test(title, body) {
     failures += 1
     console.error(`FAIL  ${title}\n      ${cause instanceof Error ? cause.message : String(cause)}`)
   }
+}
+
+/** 轮询等一个条件成立（插件扫命令目录是异步的，没有可 await 的句柄）。 */
+async function waitFor(predicate, label, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((settle) => setTimeout(settle, 25))
+  }
+  throw new Error(`等待超时：${label}`)
 }
 
 try {
@@ -503,9 +559,158 @@ try {
     assert.equal(response.status, 403)
     assert.equal(response.text(), 'forbidden')
   })
+
+  console.log('history（↑/↓ 历史指令回填的数据源）')
+
+  await test('只回真实用户指令，系统注入的 user/message 全部挡掉', async () => {
+    sessionEvents = [
+      { seq: 1, time: 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第一条' }] } },
+      { seq: 2, time: 1100, type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'AGENTS.md 全文' }] } },
+      { seq: 3, time: 1200, type: 'user/message', data: { source: { kind: 'skill-invocation' }, content: [{ type: 'text', text: '<skill_content>' }] } },
+      { seq: 4, time: 1300, type: 'assistant/message', data: { content: [{ type: 'text', text: '模型回复' }] } },
+      { seq: 5, time: 1400, type: 'user/message', data: { source: { kind: 'schedule' }, content: [{ type: 'text', text: '定时提醒' }] } },
+      { seq: 6, time: 1500, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二条' }] } },
+      { seq: 7, time: 1600, type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal 续跑' }] } },
+    ]
+    const result = await rpc('history', { sessionId: 'sess-1' })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(result.value.items.map((item) => item.text), ['第一条', '第二条'])
+    assert.deepEqual(result.value.items.map((item) => item.seq), [1, 6])
+    assert.equal(result.value.total, 2)
+    assert.equal(result.value.sessionId, 'sess-1')
+  })
+
+  await test('连续重复的指令去重，非文本块留占位符', async () => {
+    sessionEvents = [
+      { seq: 1, time: 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '再来一次' }] } },
+      { seq: 2, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '再来一次' }] } },
+      { seq: 3, time: 1200, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'image', attachment: {} }] } },
+      { seq: 4, time: 1300, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '   ' }] } },
+      { seq: 5, time: 1400, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '图文混排' }, { type: 'image', attachment: {} }, { type: 'file', attachment: { name: 'a.txt' } }] } },
+    ]
+    const result = await rpc('history', { sessionId: 'sess-1' })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(result.value.items.map((item) => item.text), ['再来一次', '[图片]', '图文混排 [图片] [文件 a.txt]'])
+  })
+
+  await test('sessionId 非法 / sessionQuery 缺席 / 日志读不了，三种失败各有各的码', async () => {
+    const bad = await rpc('history', { sessionId: '' })
+    assert.equal(bad.ok, false)
+    assert.equal(bad.error.code, 'file-extras/bad-request')
+
+    sessionQueryPresent = false
+    const missing = await rpc('history', { sessionId: 'sess-1' })
+    sessionQueryPresent = true
+    assert.equal(missing.ok, false)
+    assert.equal(missing.error.code, 'file-extras/history-unavailable')
+
+    sessionQueryThrows = true
+    const broken = await rpc('history', { sessionId: 'sess-1' })
+    sessionQueryThrows = false
+    assert.equal(broken.ok, false)
+    assert.equal(broken.error.code, 'file-extras/not-found')
+  })
+
+  console.log('斜杠命令（~/.dsh/commands/*.md）')
+
+  await test('frontmatter：读 description / input-hint，容忍引号、注释与其它键', async () => {
+    const parsed = parseCommandFile('---\nname: save\ndescription: "保存进度" # 注释\ninput-hint: <可选说明>\nempty:\n---\n\n正文第一行\n正文第二行\n')
+    assert.equal(parsed.frontmatter.description, '保存进度')
+    assert.equal(parsed.frontmatter['input-hint'], '<可选说明>')
+    assert.equal(parsed.frontmatter.name, 'save')
+    assert.equal(parsed.frontmatter.empty, undefined, '空值不该进 frontmatter')
+    assert.equal(parsed.body, '正文第一行\n正文第二行')
+  })
+
+  await test('没有 frontmatter 时整个文件都是正文，BOM 不影响', async () => {
+    assert.deepEqual(parseCommandFile('就是一段话'), { frontmatter: {}, body: '就是一段话' })
+    assert.equal(parseCommandFile('\uFEFF---\ndescription: x\n---\n正文').body, '正文')
+  })
+
+  await test('命令名文法与注册表逐字一致：save1 合法，Bad Name / 数字开头不合法', () => {
+    assert.equal(commandNameFromFile('save.md'), 'save')
+    assert.equal(commandNameFromFile('save1.md'), 'save1')
+    assert.equal(commandNameFromFile('dsh-restart.md'), 'dsh-restart')
+    assert.equal(commandNameFromFile('my_cmd.md'), 'my_cmd')
+    assert.equal(commandNameFromFile('Bad Name.md'), undefined)
+    assert.equal(commandNameFromFile('1st.md'), undefined)
+    assert.equal(commandNameFromFile('notes.txt'), undefined)
+    assert.equal(commandNameFromFile('.md'), undefined)
+  })
+
+  await test('$ARGUMENTS 替换成原始参数；没有占位符时正文原样', () => {
+    assert.equal(buildPrompt('审查 $ARGUMENTS 这段', '  src/a.ts  '), '审查 src/a.ts 这段')
+    assert.equal(buildPrompt('没有占位符', '参数被丢掉'), '没有占位符')
+    assert.equal(buildPrompt('$ARGUMENTS 和 $ARGUMENTS', 'x'), 'x 和 x')
+  })
+
+  await test('扫描：排序、跳过非法名与非 .md，description 缺失时给默认值', () => {
+    const found = discoverCommandFiles({ userDir: fakeCommandDir, maxBytes: 1024 * 1024 })
+    assert.deepEqual(found.map((item) => item.name), ['goal', 'greet', 'plain'])
+    const greet = found.find((item) => item.name === 'greet')
+    assert.equal(greet.description, '打个招呼')
+    assert.equal(greet.inputHint, '<名字>')
+    assert.equal(found.find((item) => item.name === 'plain').description, '运行 /plain')
+    // 目录不存在不是错误
+    assert.deepEqual(discoverCommandFiles({ userDir: join(fakeCommandDir, 'nope') }), [])
+  })
+
+  await test('renderPrompt 每次重新读盘，改文件立即生效', async () => {
+    const file = join(fakeCommandDir, 'greet.md')
+    assert.equal(renderPrompt(file, 1024 * 1024, '世界'), '你好，世界')
+    await writeFile(file, '改过了：$ARGUMENTS')
+    assert.equal(renderPrompt(file, 1024 * 1024, '世界'), '改过了：世界')
+    // renderPrompt 是同步函数，超限时**同步抛**，所以用 throws 而不是 rejects。
+    assert.throws(() => renderPrompt(file, 4, 'x'), /超过 4 字节上限/)
+    await writeFile(file, '---\ndescription: 打个招呼\ninput-hint: <名字>\n---\n\n你好，$ARGUMENTS\n')
+  })
+
+  await test('插件启动即注册：合法文件进注册表，重名 / 非法名不进', async () => {
+    await waitFor(() => registered.has('greet') && registered.has('plain'), '斜杠命令注册完成')
+    assert.equal(registered.has('goal'), true, 'goal 是预先占位的 app 级命令，不能被顶掉')
+    assert.equal(registered.get('goal').description, undefined, 'goal 必须还是原来那一个')
+    assert.deepEqual([...registered.keys()].sort(), ['goal', 'greet', 'plain'])
+    assert.equal(registered.get('greet').input.hint, '<名字>')
+    assert.equal(registered.get('plain').input, undefined)
+  })
+
+  await test('handler：正文渲染后作为一条普通用户消息交给 agent', async () => {
+    const definition = registered.get('greet')
+    const sent = []
+    const result = await definition.handler({
+      agent: { followup: (message) => sent.push(message) },
+      rawInput: ' 张三',
+      signal: new AbortController().signal,
+    })
+    if (result.kind === 'error' && result.text.includes('无法加载 @deepseek-ai/dsh-llm')) {
+      // 工作区没挂 node_modules 时解析不到 DSH 自己的包（装到 profile 之后才在 node_modules 链上）。
+      // 这本身也是要断言的行为：拿不到依赖就回 error，绝不抛异常、也不自己拼一个假消息。
+      console.log('      （当前工作区解析不到 @deepseek-ai/dsh-llm，只断言降级行为）')
+      return
+    }
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(result.text, '已执行 /greet')
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].role, 'user', '必须是 user 角色，不能走 inject')
+    assert.equal(sent[0].source.kind, 'user', 'source.kind 必须是 user —— history 就靠它区分人工输入')
+    assert.equal(sent[0].content[0].text, '你好，张三')
+  })
+
+  await test('handler：正文为空 / 文件被删，回 error 而不是抛异常', async () => {
+    const definition = registered.get('plain')
+    const file = join(fakeCommandDir, 'plain.md')
+    await writeFile(file, '   ')
+    const empty = await definition.handler({ agent: { followup() {} }, rawInput: '', signal: new AbortController().signal })
+    assert.equal(empty.kind, 'error')
+    await rm(file, { force: true })
+    const gone = await definition.handler({ agent: { followup() {} }, rawInput: '', signal: new AbortController().signal })
+    assert.equal(gone.kind, 'error')
+    assert.match(gone.text, /ENOENT|no such file/i)
+  })
 } finally {
   await rm(workspace, { recursive: true, force: true })
   await rm(outside, { recursive: true, force: true })
+  await rm(fakeDshHome, { recursive: true, force: true })
 }
 
 if (failures > 0) {

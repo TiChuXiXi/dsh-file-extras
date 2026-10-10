@@ -8,4 +8,7 @@
       #   webServer  —— 挂 /dsh-file-extras 这条前缀路由（RPC + 下载 + 上传）；
       #   connection —— 复用它的 requestRejection() 做信任栅栏（Host/Origin + 浏览器签名 cookie）。
       # 少任何一个，启动时都会报 cannot get property "xxx" without inject 整棵树加载失败。
+      #
+      # commands / sessionQuery **刻意不写在这里**：它们是 apply() 里 ctx.get() 懒取的，
+      # 缺席只会让「斜杠命令」或「历史回填」这两项各自降级，不会把整个插件挡在门外。
       inject: [webServer, connection]

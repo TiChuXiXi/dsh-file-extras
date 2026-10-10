@@ -1,6 +1,6 @@
 # dsh-file-extras
 
-DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`@deepseek-ai/dsh-client-ui-sidebar-files`）上补右键菜单、行内元数据、多选与删除。
+DSH Web GUI 的**日常操作增强**插件。主体是在官方「文件」页（`@deepseek-ai/dsh-client-ui-sidebar-files`）上补右键菜单、行内元数据、多选与删除；另外收了两件与文件树无关、但同样天天要用的能力：**文件驱动的斜杠命令**与**输入框 ↑/↓ 历史指令回填**。
 
 | 需求 | 现在的行为 |
 | --- | --- |
@@ -12,6 +12,64 @@ DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`
 | 文件夹大小 + 修改日期 | 行尾显示 `3 项 · 2026-03-04 13:06:07`；**只数第一级子级**（`readdir` 一层，不递归） |
 | 删除（文件夹 / 单文件 / 多文件） | 走 **二次确认框**（列出每一项是什么、多大、文件夹含多少内容）；默认**移到回收站**（可还原），「永久删除」藏在默认不勾的复选框后面 |
 | @ 到对话（文件 / 文件夹） | 直接在当前对话的输入框里插一枚 `@` 引用芯片，和用户自己敲 `@` 选出来的是**同一种东西** |
+| 斜杠快速命令 | `~/.dsh/commands/*.md` 一个文件一条 `/命令`，正文可带 `$ARGUMENTS` 占位符；改文件立即生效 |
+| ↑/↓ 快速切换历史指令 | 输入框里按 `↑`/`↓` 像终端一样翻出**本会话自己敲过的**指令，`Esc` 退出 |
+
+## 斜杠快速命令
+
+`~/.dsh/commands/<名字>.md` 一个文件一条**全局**斜杠命令，命令名就是去掉 `.md` 的文件名
+（文法与注册表逐字一致：`/^[a-z][a-z0-9_-]*$/`）。
+
+```markdown
+---
+description: 审查当前工作区的代码改动
+input-hint: 可选的补充说明
+---
+
+请审查当前工作区的代码改动，重点关注潜在 bug 和安全问题。
+
+$ARGUMENTS
+```
+
+| 行为 | 说明 |
+| --- | --- |
+| frontmatter | 读 `description`（发现界面里的说明）与 `input-hint`（输入提示），其余键忽略但容忍 |
+| `$ARGUMENTS` | 换成用户敲在命令名后面的原始参数；没有这个占位符时正文原样发出 |
+| 改文件立即生效 | 正文是**每次调用时**重新读盘的，不用重启 |
+| 新增 / 删除文件 | 需要重启 `dsh web` 才反映（注册是启动时扫一遍目录） |
+| 执行结果 | 正文作为一条**普通用户消息**交给 agent —— 与用户自己把这段话敲进输入框等价，不是系统注入 |
+
+用的是官方 `ctx.commands.register()`（`@deepseek-ai/dsh-commands`），所以发现、补全、
+`command/run` / `command/done` 生命周期事件全归官方。与 app 级命令（`/goal` 之类）重名时
+**只跳过这一条并告警**，不会把其余命令一起带走。
+
+> 这条能力移植自 [dsh-command-md](https://github.com/TiChuXiXi/dsh-command-md)（同一作者，MIT）。
+
+## ↑/↓ 快速切换历史指令
+
+在输入框里按 `↑` 翻出本会话里自己敲过的指令，再按 `↑` 往更早走，`↓` 往新的走。
+第一次 `↑` 时当前草稿会存起来，一路 `↓` 翻回最新一条之后再按 `↓`（或按 `Esc`）就原样还回来。
+穿梭时输入框上方有一条 `历史指令 … ↑↓ 3/12 · Esc 退出` 的提示条。
+
+| 键 | 接管条件 | 行为 |
+| --- | --- | --- |
+| `↑` | 光标已贴在草稿**最开头**（或草稿为空） | 进入穿梭 / 往更早一条 |
+| `↓` | 只在穿梭模式里 | 往新一条；已是最新时还回原草稿并退出 |
+| `Esc` | 只在穿梭模式里 | 还回原草稿并退出 |
+| 任何真实输入 | 只在穿梭模式里 | 立即退出穿梭（`beforeinput`：打字 / 退格 / 粘贴 / 拖入 / 输入法） |
+| `/`、`@` 候选菜单开着时 | —— | **一律不抢键**（那里 `↑`/`↓` 是选候选） |
+
+数据**不是**从聊天视图里抠的（那里只有已加载的一窗），而是走 host 半区的 RPC `history`：
+它读 `ctx.sessionQuery.readSession()` 的**完整事件日志**，只挑 `source.kind === 'user'` 的真实用户指令
+—— 所以「更早」那些也在，而 AGENTS.md、技能目录、定时提醒这类 `agent.inject()` 塞进去的系统上下文不在。
+（实测一个真实会话：38 条 `user/message` 里只有 11 条 kind 是 `user`，其余 27 条是
+`time-context` / `runtime-context` / `skill-catalog` / `agent-instructions` / `compact-checkpoint` / `user-approval`。）
+
+回填用官方 `inputActions.setDraft()` 整条替换草稿：不碰编辑器内部，不自己实现输入框。
+host 通道取不到历史时 `↑`/`↓` **完全不接管** —— 宁可这个功能静默失效，也不能让用户觉得键盘坏了。
+
+> 这条能力移植自 [dsh-message-jump](https://github.com/TiChuXiXi/dsh-message-jump) 的
+> 「输入框 ↑/↓ 历史消息穿梭」（同一作者，MIT）；该插件另一半的悬浮指令导航条**没有**收进来。
 
 ## @ 到对话
 
@@ -58,19 +116,23 @@ DSH Web GUI 的**工作区文件树增强**插件：在官方「文件」页（`
 host 半区在 `ctx.webServer` 上挂一条前缀路由 `/dsh-file-extras`：
 
 - `POST /dsh-file-extras/stat` —— Connection RPC 信封，批量取 大小 / mtime / 一级子项数量；
+- `POST /dsh-file-extras/history` —— 某个会话里真实用户指令的全文列表（↑/↓ 回填的数据源）；
 - `GET  /dsh-file-extras/download?root=&path=` —— 流式回文件字节 + `Content-Disposition`；
 - `POST /dsh-file-extras/upload?root=&dir=&name=` —— 请求体即原始字节，写进目标目录；
 - `POST /dsh-file-extras/remove` —— 删除（RPC 信封），默认移入回收站，逐条独立结算。
 
-浏览器的右键菜单注册进 `shell.overlay`（框架级浮层，本来就在每一列之上、滚动容器之外）。
+浏览器的右键菜单注册进 `shell.overlay`（框架级浮层，本来就在每一列之上、滚动容器之外），
+历史回填提示条注册进 `conversation.input.dock`（输入框卡片上方那条整宽座位）。
+斜杠命令与这两者都无关，走官方 `ctx.commands.register()`，不经过本插件的通道。
 
 ## 文件
 
 | 文件 | 作用 |
 | --- | --- |
-| [index.js](index.js) | host 半区：`/dsh-file-extras` 前缀路由 —— RPC `stat`（大小 / mtime / 一级子项数）、`remove`、`GET download`、`POST upload` |
+| [index.js](index.js) | host 半区：`/dsh-file-extras` 前缀路由（RPC `stat` / `history` / `remove`、`GET download`、`POST upload`）+ 扫描 `~/.dsh/commands/*.md` 注册斜杠命令 |
+| [lib/commands-md.js](lib/commands-md.js) | 命令文件的纯解析层：frontmatter、`$ARGUMENTS`、目录扫描（零依赖，可脱离 DSH 单测） |
 | [lib/trash.js](lib/trash.js) | 跨平台「移入回收站」：Windows / Linux / macOS 三套后端；平台与家目录可注入，所以三套逻辑能在任意一台机器上实测 |
-| [lib/client.js](lib/client.js) | 浏览器半区：行内元数据 + 多选 + 右键菜单 + 删除确认框 + @ 到对话（注册进 `shell.overlay`） |
+| [lib/client.js](lib/client.js) | 浏览器半区：行内元数据 + 多选 + 右键菜单 + 删除确认框 + @ 到对话（`shell.overlay`）+ ↑/↓ 历史回填（`conversation.input.dock`） |
 | [cordis.patch.yml](cordis.patch.yml) | loader 行（`inject: [webServer, connection]`） |
 | [package.json](package.json) | `dsh.bundle` + `dsh.client` |
 | [scripts/selftest.mjs](scripts/selftest.mjs) / [scripts/dom-probe.mjs](scripts/dom-probe.mjs) / [scripts/trash-bin.mjs](scripts/trash-bin.mjs) | 两层自检 + 回收站测试清理助手 |
@@ -128,6 +190,23 @@ dsh plugin --profile web add dsh-file-extras
   从文件树里认出用户点了哪个路径、拼出和官方 `@` 补全逐字一致的提及文本。
   提及语法（引号规则、目录尾斜杠）是 `formatFileMention` 的复刻 —— 改它之前先对照
   `@deepseek-ai/dsh-file-reference` 的 grammar，**一个字都不能差**：差一个引号，模型就会把带空格的路径拆成两段。
+- **`history` 只认 `source.kind === 'user'`**。事件日志里 user 角色的消息有两大类：人工输入 /
+  steering，以及 `agent.inject()` 塞进去的系统上下文。后者的 `source.kind` 各自不同
+  —— 实测一个真实会话（38 条 `user/message`）里出现过 `time-context` / `runtime-context` /
+  `skill-catalog` / `agent-instructions` / `compact-checkpoint` / `user-approval`，
+  只有人工输入的 kind 恰好是 `'user'`（11 条）。判断写的是「等于 `user`」而不是「不等于某某」，
+  所以上游再加新的注入类型也漏不进来。
+  斜杠命令的 handler 也正因此才用 `createUserMessage({ source: { kind: 'user' } })` 而不是
+  `agent.inject()` —— 那样它才会被当成「用户敲的指令」进历史。
+- **`↑`/`↓` 只在能安全接管时才接管**。编辑器是 Lexical 的 `contenteditable`（不是 textarea），
+  所以 `↑` 只在光标贴最开头时抢，`↓` 只在穿梭模式里抢，候选菜单开着时一律不抢；
+  事件监听挂在 `document` 的**捕获阶段** + `stopImmediatePropagation()`，才能先于 Lexical 的
+  root 监听和 React 的委托监听。退出穿梭靠原生 `beforeinput`（Lexical 的程序化 `setDraft`
+  不触发它，所以回填本身不会被误判成用户编辑）。
+- **斜杠命令用官方注册表，`@deepseek-ai/dsh-llm` 是动态 import**。这个包只在 DSH 自己的
+  node_modules 里，从第三方插件目录不一定解析得到；拿不到就**只让这一条命令回 error**，
+  不自己拼一个假的 `UserMessage`（那会绕过官方的 id / 冻结 / source 约定）。
+  同理，命令目录优先走官方的 `@deepseek-ai/dsh-home-paths`（认 `$DSH_HOME`），拿不到时按同一套优先级自己算。
 - **回收站不是文件系统特性，是 Shell 特性**。`fs.rm` / `unlink` / `rmdir` 落到内核的删除原语，
   删掉就是删掉；真正「移入回收站」的在 Windows 上是 `SHFileOperation`（要在
   `<卷>:\$Recycle.Bin\<SID>\` 下写一对 `$I`（元数据）+ `$R`（数据）文件并登记进用户回收站索引，
@@ -140,8 +219,8 @@ dsh plugin --profile web add dsh-file-extras
 ## 自检
 
 ```powershell
-node scripts/selftest.mjs                  # host 半区：假 ctx/req/res 驱动路由，35 个用例（真文件系统 + 三套回收站后端）
-node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，70 条断言
+node scripts/selftest.mjs                  # host 半区：假 ctx/req/res 驱动路由，47 个用例（真文件系统 + 三套回收站后端 + 命令文件解析）
+node scripts/dom-probe.mjs                 # 浏览器半区：headless Chrome 里跑真实 lib/client.js，83 条断言
 node scripts/dom-probe.mjs --shot out/     # 同上，另存浅色（多选+菜单）与深色（删除确认框）两张截图
 ```
 
@@ -152,6 +231,11 @@ node scripts/dom-probe.mjs --shot out/     # 同上，另存浅色（多选+菜�
 
 `dom-probe.mjs` 会把完整结果写到 `.npm-cache/domprobe/last-result.json`，断言消息只留 300 字摘要。
 复选框那几步走的是 CDP 的真实鼠标事件（合成事件驱动不了 checkbox 的激活行为，详见脚本内注释）。
+
+> `selftest.mjs` 里「handler 把正文当用户消息交给 agent」那一条需要解析到
+> `@deepseek-ai/dsh-llm`（只有装到 profile 之后才在 node_modules 链上）。
+> 工作区里解析不到时会打印一行提示并只断言降级行为 —— 想在本地跑全，把 DSH 的
+> `@deepseek-ai` 挂到工作区的 `node_modules/` 下即可（该目录已 gitignore）。
 
 `dom-probe.mjs` 需要 react/react-dom 的 UMD 构建：
 
@@ -185,3 +269,12 @@ npm install --prefix .npm-cache/domprobe --cache .npm-cache --registry=https://r
   回收站被系统关掉、或条目超过回收站配额时，**Windows / macOS 自己会改成永久删除** —— 那是系统的行为，插件无法区分。
 - 没有回收站后端的平台（FreeBSD 等）会明确回 `file-extras/trash-unavailable`，
   确认框里勾「永久删除」仍可继续。
+- **斜杠命令是启动时扫一遍目录**：改已有文件的正文立即生效（每次调用重新读盘），
+  但新增 / 删除 / 改名 `.md` 文件要重启 `dsh web` 才反映。
+- **`history` 依赖 `ctx.sessionQuery`**（`dsh-base` 里的 `session-query-sqlite` 提供）。
+  缺席时该端点回 `file-extras/history-unavailable`，浏览器侧 `↑`/`↓` 完全不接管，
+  文件树那部分功能不受任何影响。
+- **`history` 只回最近 300 条、单条截 20000 字符**：回填到输入框用，不做无上限搬运。
+- 本插件把 `conversation` / `sessions` / `sidebarRight` / `commands` / `sessionQuery` 全部
+  **懒取**（`ctx.get(...)`）而不是写进 `inject`：任何一项缺席都只让对应功能降级或报错，
+  不会把整个插件挡在门外。

@@ -156,6 +156,11 @@ html,body{margin:0;padding:0;background:var(--dsw-alias-bg-base);color:var(--dsw
 .fx-other{color:var(--dsw-alias-label-tertiary);cursor:default}
 .fx-name{white-space:nowrap;text-overflow:ellipsis;min-width:0;overflow:hidden}
 .fx-tool{width:28px;height:28px}
+/* —— 官方输入框的 DOM 契约：dock 在卡片上方，编辑器本体带 data-composer-input —— */
+#composer{width:340px;margin:8px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px}
+[data-input-scroll]{padding:4px}
+[data-composer-input]{min-height:44px;outline:none;white-space:pre-wrap;word-break:break-word}
+#dock-root:empty{display:none}
 </style></head><body>
 <div id="panel">
   <div class="fx-root" data-files-state="tree" data-files-root="${FIXTURE_ROOT}">
@@ -163,6 +168,11 @@ html,body{margin:0;padding:0;background:var(--dsw-alias-bg-base);color:var(--dsw
     <div class="fx-body" data-files-body><ul class="fx-level">${top}</ul></div>
   </div>
 </div>
+<div id="composer">
+  <div id="dock-root"></div>
+  <div data-input-scroll><div data-composer-input contenteditable="true" role="textbox" aria-multiline="true"></div></div>
+</div>
+<div role="listbox" id="fake-candidates" style="display:none"><div>候选一</div></div>
 <div id="outside" style="position:fixed;left:0;bottom:0;width:340px;height:40px;background:var(--dsw-alias-bg-layer-2)">树外的空白区</div>
 <div id="control-root" style="position:fixed;right:8px;top:8px"></div>
 <input type="checkbox" id="plain-box" style="position:fixed;right:8px;top:40px">
@@ -192,6 +202,7 @@ window.__reloadClicks = 0
 document.querySelector('[data-files-reload]').addEventListener('click', () => { window.__reloadClicks += 1 })
 
 window.__calls = []
+window.__historyCalls = 0
 window.__fetchCalls = []
 window.__anchors = []
 window.__clipboard = []
@@ -207,6 +218,16 @@ document.querySelector('[data-files-body]').addEventListener('click', (event) =>
 
 const callChannel = async (channel, endpoint, payload) => {
   window.__calls.push({ channel, endpoint, payload })
+  if (endpoint === 'history') {
+    // 单独记一个不会被中途清空的计数：__calls 在下载用例前会被清一次，
+    // 用它去数「进会话拉了几次历史」会数成 0。
+    window.__historyCalls += 1
+    if (window.__historyMode === 'fail') throw new Error('history 通道不可用')
+    return {
+      ok: true,
+      value: { sessionId: payload.sessionId, total: window.__historyItems.length, items: window.__historyItems.slice() },
+    }
+  }
   if (endpoint === 'remove') {
     const permanent = payload.permanent === true
     window.__removed.push({ paths: payload.paths.slice(), permanent })
@@ -280,6 +301,71 @@ if (registered['dsh-file-extras-menu'] === undefined) {
 }
 ReactDOM.createRoot(document.getElementById('overlay-root')).render(React.createElement(registered['dsh-file-extras-menu']))
 await wait(300)
+
+/* —— ↑/↓ 历史指令：假 history 数据 + 一个把 draft 当受控值的宿主组件 ——
+   官方 dock 座位给的 props 就是 { sessionId, input, inputActions }，这里逐字复刻。 —— */
+window.__historyItems = [
+  { seq: 1, time: 1000, text: '第一条指令' },
+  { seq: 2, time: 2000, text: '第二条指令' },
+  { seq: 3, time: 3000, text: '第三条指令' },
+]
+window.__historyMode = 'ok'
+window.__setDraftCalls = []
+window.__draft = ''
+const draftListeners = new Set()
+const setDraft = (text) => {
+  window.__draft = text
+  for (const fn of draftListeners) fn()
+}
+
+function HistoryHarness() {
+  const draft = React.useSyncExternalStore(
+    (cb) => { draftListeners.add(cb); return () => { draftListeners.delete(cb) } },
+    () => window.__draft,
+  )
+  const inputActions = React.useMemo(() => ({
+    setDraft: (text) => { window.__setDraftCalls.push(text); setDraft(text) },
+  }), [])
+  return React.createElement(registered['dsh-file-extras-history'], {
+    sessionId: 'sess-1',
+    input: { draft },
+    inputActions,
+  })
+}
+if (registered['dsh-file-extras-history'] === undefined) {
+  return { error: 'conversation.input.dock 上没注册到 dsh-file-extras-history，注册到的是：' + Object.keys(registered).join(',') }
+}
+ReactDOM.createRoot(document.getElementById('dock-root')).render(React.createElement(HistoryHarness))
+await wait(200)
+
+const editor = document.querySelector('[data-composer-input]')
+const dockStrip = () => document.querySelector('.dsh-fx-history')
+const dockText = () => (dockStrip() === null ? null : dockStrip().textContent)
+/** 把光标放到编辑器内容的开头 / 末尾（穿梭的接管条件就靠它区分）。 */
+const placeCaret = (where) => {
+  const range = document.createRange()
+  range.selectNodeContents(editor)
+  range.collapse(where === 'start')
+  const selection = window.getSelection()
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+/** 模拟用户敲字：改 DOM 文本 + 受控 draft，并把光标放到末尾。 */
+const typeInto = (text) => {
+  editor.textContent = text
+  setDraft(text)
+  placeCaret('end')
+}
+/** 在编辑器上按一个键，返回事件本身（看 defaultPrevented 就知道有没有被接管）。 */
+const pressKey = (key) => {
+  const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  editor.dispatchEvent(event)
+  return event
+}
+/** 派发一个原生 beforeinput（真实输入 / 退格 / 粘贴都会走它）。 */
+const fireBeforeInput = () => {
+  editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: 'x' }))
+}
 
 /* —— 对照组：一个最朴素的 React 受控复选框。用来区分「程序化 click 不触发 React onChange」
       和「我们的组件写错了」—— 前者是测试环境问题，后者是插件问题。 —— */
@@ -934,7 +1020,137 @@ await wait(150)
 result.mentionForeignCwd = await runMention('@ 到对话')
 window.__sessionCwd = window.__fixtureRoot
 
-/* ================= 9. 卸载还原 ================= */
+/* ================= 9. 输入框 ↑/↓ 历史指令回填 ================= */
+// 先收干净（确认框 → 菜单 → 选择）
+await escape()
+await escape()
+await escape()
+
+/** 每个用例前把穿梭状态清干净：清空草稿 + 等一次「草稿变空」的防抖刷新落定。 */
+const resetHistory = async () => {
+  typeInto('')
+  await wait(450)
+  window.__setDraftCalls.length = 0
+}
+const historyCalls = () => window.__historyCalls
+
+result.historyDock = {
+  present: registered['dsh-file-extras-history'] !== undefined,
+  stripBefore: dockStrip() === null,
+  calls: historyCalls(),
+}
+
+// 9a. 草稿为空 + 光标在开头：↑ 必须被拦下，并回填最新一条
+await resetHistory()
+placeCaret('start')
+const up1 = pressKey('ArrowUp')
+await wait(80)
+result.historyEmptyUp = {
+  prevented: up1.defaultPrevented,
+  draft: window.__draft,
+  strip: dockText(),
+  calls: window.__setDraftCalls.slice(),
+}
+
+// 9b. 再按 ↑：往更早走
+placeCaret('end')
+const up2 = pressKey('ArrowUp')
+await wait(80)
+result.historyUpAgain = { prevented: up2.defaultPrevented, draft: window.__draft, strip: dockText() }
+
+// 9c. ↑ 到最老一条后不再越界（键仍被拦下，光标不许乱跑）
+pressKey('ArrowUp')
+await wait(60)
+const up3 = pressKey('ArrowUp')
+await wait(60)
+result.historyUpClamp = { prevented: up3.defaultPrevented, draft: window.__draft, strip: dockText() }
+
+// 9d. ↓ 往新的走
+const down1 = pressKey('ArrowDown')
+await wait(60)
+result.historyDown = { prevented: down1.defaultPrevented, draft: window.__draft, strip: dockText() }
+
+// 9e. 已经是最新一条时再按 ↓：还回穿梭前的草稿并退出
+const down2 = pressKey('ArrowDown')
+await wait(60)
+const atNewest = { draft: window.__draft, strip: dockText() }
+const down3 = pressKey('ArrowDown')
+await wait(80)
+result.historyDownRestore = {
+  atNewest,
+  prevented: down3.defaultPrevented,
+  draft: window.__draft,
+  stripGone: dockStrip() === null,
+}
+
+// 9f. 光标不在开头（草稿非空）：↑ 必须**不拦**，把键还给编辑器
+window.__setDraftCalls.length = 0
+typeInto('正在编辑的一段话')
+placeCaret('end')
+const upMid = pressKey('ArrowUp')
+await wait(60)
+result.historyCaretGuard = {
+  prevented: upMid.defaultPrevented,
+  draft: window.__draft,
+  stripGone: dockStrip() === null,
+  calls: window.__setDraftCalls.slice(),
+}
+
+// 9g. 光标在开头 + 草稿非空：↑ 接管，且原草稿进 stash；Esc 还回来
+placeCaret('start')
+const upStash = pressKey('ArrowUp')
+await wait(80)
+const stashed = { prevented: upStash.defaultPrevented, draft: window.__draft, strip: dockText() }
+const escEvent = pressKey('Escape')
+await wait(80)
+result.historyStash = {
+  ...stashed,
+  escPrevented: escEvent.defaultPrevented,
+  afterEsc: window.__draft,
+  stripGone: dockStrip() === null,
+}
+
+// 9h. / @ 候选菜单开着时一律不抢键
+typeInto('')
+await wait(400)
+placeCaret('start')
+document.getElementById('fake-candidates').style.display = 'block'
+const upMenu = pressKey('ArrowUp')
+await wait(60)
+const menuOpen = { prevented: upMenu.defaultPrevented, stripGone: dockStrip() === null }
+document.getElementById('fake-candidates').style.display = 'none'
+await wait(60)
+
+// 9i. 真实输入（beforeinput）退出穿梭
+placeCaret('start')
+pressKey('ArrowUp')
+await wait(80)
+const inHistory = dockStrip() !== null
+fireBeforeInput()
+await wait(80)
+result.historyMenuAndEdit = { ...menuOpen, inHistory, exitedOnEdit: dockStrip() === null }
+
+// 9j. host 通道拿不到历史：↑ 必须完全不接管（不能让键盘像坏了一样）
+window.__historyMode = 'fail'
+typeInto('占位')
+await wait(60)
+typeInto('')
+await wait(450)
+placeCaret('start')
+const upFail = pressKey('ArrowUp')
+await wait(120)
+result.historyUnavailable = { prevented: upFail.defaultPrevented, stripGone: dockStrip() === null, draft: window.__draft }
+window.__historyMode = 'ok'
+
+// 9k. 草稿变空（刚发完一条）会防抖重拉一次，保证下一条 ↑ 翻到的是刚发出去的那条
+typeInto('刚发出去的一条')
+await wait(80)
+const callsAfterSend = historyCalls()
+typeInto('')
+await wait(450)
+result.historyRefreshAfterSend = { extraCalls: historyCalls() - callsAfterSend }
+
+/* ================= 10. 卸载还原 ================= */
 result.finalErrors = window.__errors
 return result
 `
@@ -1469,6 +1685,76 @@ if (result.error !== undefined) {
     JSON.stringify(onlyReference(result.mentionForeignCwd)?.ref) === JSON.stringify('@D:/fixture/alpha.txt')
       ? undefined
       : JSON.stringify(result.mentionForeignCwd))
+
+  /* ---- 9. 输入框 ↑/↓ 历史指令回填 ---- */
+  ok('↑/↓ 历史回填挂进了 conversation.input.dock，且不穿梭时不占位置',
+    result.historyDock.present === true && result.historyDock.stripBefore === true
+      ? undefined
+      : JSON.stringify(result.historyDock))
+  ok('进会话就先拉过一次历史（不能等按了键才去取）',
+    result.historyDock.calls >= 1 ? undefined : JSON.stringify(result.historyDock))
+  ok('草稿为空 + 光标在开头：↑ 被拦下，回填最新一条，提示条显示 3/3',
+    result.historyEmptyUp.prevented === true
+      && result.historyEmptyUp.draft === '第三条指令'
+      && JSON.stringify(result.historyEmptyUp.calls) === JSON.stringify(['第三条指令'])
+      && typeof result.historyEmptyUp.strip === 'string'
+      && result.historyEmptyUp.strip.includes('3/3')
+      ? undefined
+      : JSON.stringify(result.historyEmptyUp))
+  ok('再按 ↑ 往更早走（2/3）',
+    result.historyUpAgain.prevented === true && result.historyUpAgain.draft === '第二条指令'
+      && result.historyUpAgain.strip.includes('2/3')
+      ? undefined
+      : JSON.stringify(result.historyUpAgain))
+  ok('↑ 到最老一条后不再越界：键仍被拦下，草稿停在第一条（1/3）',
+    result.historyUpClamp.prevented === true && result.historyUpClamp.draft === '第一条指令'
+      && result.historyUpClamp.strip.includes('1/3')
+      ? undefined
+      : JSON.stringify(result.historyUpClamp))
+  ok('↓ 往新的走（第二条）',
+    result.historyDown.prevented === true && result.historyDown.draft === '第二条指令'
+      ? undefined
+      : JSON.stringify(result.historyDown))
+  ok('↓ 一路翻到最新一条后，再按 ↓ 还回穿梭前的草稿并退出',
+    result.historyDownRestore.atNewest.draft === '第三条指令'
+      && result.historyDownRestore.prevented === true
+      && result.historyDownRestore.draft === ''
+      && result.historyDownRestore.stripGone === true
+      ? undefined
+      : JSON.stringify(result.historyDownRestore))
+  ok('光标不在开头时 ↑ 完全不接管（把键还给编辑器移动光标）',
+    result.historyCaretGuard.prevented === false
+      && result.historyCaretGuard.draft === '正在编辑的一段话'
+      && result.historyCaretGuard.stripGone === true
+      && result.historyCaretGuard.calls.length === 0
+      ? undefined
+      : JSON.stringify(result.historyCaretGuard))
+  ok('光标在开头 + 草稿非空：↑ 接管并把原草稿存进 stash，Esc 原样还回来',
+    result.historyStash.prevented === true
+      && result.historyStash.draft === '第三条指令'
+      && result.historyStash.escPrevented === true
+      && result.historyStash.afterEsc === '正在编辑的一段话'
+      && result.historyStash.stripGone === true
+      ? undefined
+      : JSON.stringify(result.historyStash))
+  ok('/ @ 候选菜单开着时 ↑ 一律不抢（那里 ↑/↓ 是选候选）',
+    result.historyMenuAndEdit.prevented === false && result.historyMenuAndEdit.stripGone === true
+      ? undefined
+      : JSON.stringify(result.historyMenuAndEdit))
+  ok('真实输入（beforeinput）立即退出穿梭',
+    result.historyMenuAndEdit.inHistory === true && result.historyMenuAndEdit.exitedOnEdit === true
+      ? undefined
+      : JSON.stringify(result.historyMenuAndEdit))
+  ok('host 通道取不到历史时：↑ 完全不接管，键盘不能像坏了一样',
+    result.historyUnavailable.prevented === false
+      && result.historyUnavailable.stripGone === true
+      && result.historyUnavailable.draft === ''
+      ? undefined
+      : JSON.stringify(result.historyUnavailable))
+  ok('草稿变空（刚发完一条）会重拉一次历史，保证下一条 ↑ 翻到的是刚发出去的那条',
+    result.historyRefreshAfterSend.extraCalls >= 1
+      ? undefined
+      : JSON.stringify(result.historyRefreshAfterSend))
 }
 
 console.log(lines.join('\n'))

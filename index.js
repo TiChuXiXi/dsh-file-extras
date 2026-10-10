@@ -14,7 +14,19 @@
  *   4. RPC `remove`  —— 删除（文件夹连同其全部内容）。**默认走回收站**（Shell 的 SHFileOperation，
  *      可还原），`permanent: true` 才走 fs.rm。逐条独立结算；拒绝工作区根、拒绝区外路径，
  *      软链接只删链接本身、绝不跟随。浏览器侧负责二次确认，并用一个默认不勾的复选框把
- *      「移到回收站」和「永久删除」两条路分开。
+ *      「移到回收站」和「永久删除」两条路分开；
+ *   5. RPC `history` —— 某个会话里**真实用户敲过的指令**全文列表（按 seq 升序）。数据源是
+ *      `ctx.sessionQuery.readSession()` 的完整事件日志，所以覆盖尚未加载到聊天视图的「更早」，
+ *      浏览器侧拿它做输入框 ↑/↓ 历史回填。只收 `source.kind === 'user'`，把 AGENTS.md、
+ *      技能目录、定时提醒这类系统注入的 `user/message` 挡在外面。
+ *
+ * 另外还有一条与文件树无关、但同属「把日常操作收进一个插件」的能力（host 半区直接注册，
+ * 不走自己的 RPC 通道）：
+ *
+ *   6. **文件驱动的斜杠命令** —— 扫 `~/.dsh/commands/*.md`，一个文件一条全局斜杠命令
+ *      （移植自 https://github.com/TiChuXiXi/dsh-command-md）。命令正文在**每次调用时**重新读盘，
+ *      改文件立即生效；正文里的 `$ARGUMENTS` 换成用户敲的参数，然后作为一条普通用户消息
+ *      交给 agent。用的是官方 `ctx.commands.register()`，所以发现、补全、生命周期事件全归官方。
  *
  * 依赖策略（照抄 dsh-git-vcs 踩过的坑）：只用 `inject: ['webServer','connection']` 两个硬依赖，
  * 文件系统走 node:fs —— `ctx.fs` 与 workspaceFiles 一样不暴露 mtime。
@@ -35,9 +47,11 @@
 import { createReadStream, createWriteStream } from 'node:fs'
 import { lstat, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, parse as parsePath, resolve as resolvePath, sep } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 
+import { discoverCommandFiles, renderPrompt } from './lib/commands-md.js'
 import { moveToTrash } from './lib/trash.js'
 
 /** loader 行标识。 */
@@ -70,6 +84,23 @@ const MAX_RPC_BYTES = 32 * 1024 * 1024
 /** 目标目录里重名时最多试到第几号（`name (1).ext` … `name (999).ext`）。 */
 const MAX_RENAME_ATTEMPTS = 999
 
+/** 单条命令文件的字节上限（超过就跳过，不进注册表）。 */
+const MAX_COMMAND_BYTES = 1024 * 1024
+
+/** 历史回填一次最多回多少条指令（从**最新**往前取，够翻很久了）。 */
+const MAX_HISTORY_ITEMS = 300
+
+/** 历史回填单条指令的字符上限（回填到输入框用，长文截断免得一条占满）。 */
+const MAX_HISTORY_TEXT = 20000
+
+/**
+ * 用户级命令目录名，挂在 DSH home 之下（默认 `~/.dsh/commands`）。
+ *
+ * home 走官方的 `@deepseek-ai/dsh-home-paths`（认 `$DSH_HOME`），拿不到时退回 `~/.dsh` ——
+ * 与 `dsh-home-paths` 自己的默认值同口径。
+ */
+const COMMANDS_DIR_NAME = 'commands'
+
 /** 端点自己的错误类型：`code` 直接进 RPC 失败体，浏览器侧按 code 分支。 */
 class FileExtrasError extends Error {
   /**
@@ -87,6 +118,131 @@ class FileExtrasError extends Error {
 /** 把任意异常压成可读字符串。 */
 function messageOf(cause) {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+/**
+ * 解析用户级命令目录（默认 `~/.dsh/commands`）。
+ *
+ * 优先用官方的 `@deepseek-ai/dsh-home-paths`：它认 `$DSH_HOME`，是 DSH 自己到处在用的口径。
+ * 动态 import 而不是顶层 import —— 这个包只在 DSH 自己的 node_modules 里，从第三方插件目录
+ * 不一定解析得到；拿不到时按同一套优先级（`$DSH_HOME` → `~/.dsh`）自己算一遍。
+ * **不能**因为一个可选的路径工具让整个插件起不来。
+ *
+ * @returns {Promise<string>} 命令目录的绝对路径。
+ */
+async function resolveCommandsDir() {
+  try {
+    const { dshHomePath } = await import('@deepseek-ai/dsh-home-paths')
+    return dshHomePath(COMMANDS_DIR_NAME)
+  } catch {
+    const configured = process.env.DSH_HOME
+    const home = typeof configured === 'string' && configured.trim() !== ''
+      ? resolvePath(configured.trim())
+      : join(homedir(), '.dsh')
+    return join(home, COMMANDS_DIR_NAME)
+  }
+}
+
+/**
+ * 把一条消息的 content 块压成纯文本，给历史回填用。
+ *
+ * 与官方聊天节点同一口径：文本与推理直接拼，图片 / 文件 / 工具调用各留一个占位符，
+ * 这样「只发了张图」的那一条也还是能出现在历史里。
+ *
+ * @param {readonly object[]} blocks - `UserMessage.content`。
+ * @returns {string} 去掉首尾空白后的文本（可能为空串）。
+ */
+function blocksToText(blocks) {
+  let out = ''
+  for (const block of blocks ?? []) {
+    if (block === null || typeof block !== 'object') continue
+    const pad = out !== '' && !/\s$/.test(out) ? ' ' : ''
+    if (block.type === 'text' || block.type === 'reasoning') {
+      if (typeof block.text === 'string') out += block.text
+    } else if (block.type === 'image') {
+      out += `${pad}[图片]`
+    } else if (block.type === 'file') {
+      const name = block.attachment?.name
+      out += `${pad}[文件${typeof name === 'string' && name !== '' ? ` ${name}` : ''}]`
+    } else if (block.type === 'tool-call') {
+      out += `${pad}[工具调用]`
+    }
+  }
+  return out.replace(/\s+$/, '').trim()
+}
+
+/**
+ * 把 `~/.dsh/commands/*.md` 逐条注册成全局斜杠命令。
+ *
+ * 注册是**一次性**的（启动时扫一遍目录）：新增 / 删除文件要重启才反映，
+ * 但改已有文件的正文立即生效 —— 正文是 handler 每次调用时重新读盘的。
+ *
+ * 逐条 try/catch：与 app 级命令（`/goal` 之类）重名只跳过这一条并告警，
+ * 不能让一条重名把其余命令全带走。
+ *
+ * @param {object} ctx - host context（用来挂 effect 做卸载清理）。
+ * @param {object} commands - `ctx.commands` 服务。
+ * @returns {Promise<number>} 实际注册成功的条数。
+ */
+async function registerFileCommands(ctx, commands) {
+  const userDir = await resolveCommandsDir()
+  const discovered = discoverCommandFiles({ userDir, maxBytes: MAX_COMMAND_BYTES })
+  if (discovered.length === 0) {
+    console.log(`[dsh-file-extras] ${userDir} 下没有命令文件，斜杠命令未注册。`)
+    return 0
+  }
+
+  // 正文渲染成一条普通用户消息交给 agent —— 与用户自己把这段话敲进输入框等价，
+  // 所以走 `createUserMessage({ source: { kind: 'user' } })`：它会在聊天里渲染成正常用户消息，
+  // 也会以 user 角色进模型请求，而不是像 `agent.inject()` 那样变成系统注入的上下文。
+  let createUserMessage = null
+  const loadLlm = async () => {
+    if (createUserMessage === null) {
+      ;({ createUserMessage } = await import('@deepseek-ai/dsh-llm'))
+    }
+    return createUserMessage
+  }
+
+  let registered = 0
+  for (const command of discovered) {
+    const definition = {
+      name: command.name,
+      description: command.description,
+      ...(command.inputHint === undefined ? {} : { input: { hint: command.inputHint } }),
+      handler: async (invocation) => {
+        let prompt
+        try {
+          prompt = renderPrompt(command.file, MAX_COMMAND_BYTES, invocation.rawInput)
+        } catch (cause) {
+          return { kind: 'error', text: messageOf(cause) }
+        }
+        if (prompt === '') {
+          return { kind: 'error', text: `/${command.name} 的正文是空的：${command.file}` }
+        }
+        let build
+        try {
+          build = await loadLlm()
+        } catch (cause) {
+          return { kind: 'error', text: `无法加载 @deepseek-ai/dsh-llm：${messageOf(cause)}` }
+        }
+        try {
+          invocation.agent.followup(build({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } }))
+        } catch (cause) {
+          return { kind: 'error', text: `提交失败：${messageOf(cause)}` }
+        }
+        return { kind: 'success', text: `已执行 /${command.name}` }
+      },
+    }
+    try {
+      // disposer 挂在 ctx.effect 上：插件卸载 / 热重载时命令跟着撤销，不会留下悬空注册。
+      ctx.effect(() => commands.register(definition), `dsh-file-extras: /${command.name}`)
+      registered += 1
+    } catch (cause) {
+      console.warn(`[dsh-file-extras] 跳过 /${command.name}（${command.file}）：${messageOf(cause)}`)
+    }
+  }
+  console.log(`[dsh-file-extras] 已注册 ${registered}/${discovered.length} 条斜杠命令（${userDir}）`)
+  return registered
 }
 
 /** Windows 盘符 / POSIX 根：`C:\`、`\\server\share`、`/`。 */
@@ -304,6 +460,7 @@ function statusForCode(code) {
     case 'file-extras/busy':
     case 'file-extras/trash-failed': return 409
     case 'file-extras/trash-unavailable': return 501
+    case 'file-extras/history-unavailable': return 501
     case 'file-extras/trash-timeout': return 504
     case 'file-extras/too-large': return 413
     case 'file-extras/not-found': return 404
@@ -316,6 +473,18 @@ function statusForCode(code) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - host 根 context。
  */
 export function apply(ctx) {
+  // 斜杠命令与 web 通道无关，所以先注册：即使 webServer / connection 缺席（非 Web 形态），
+  // 文件驱动的命令照样能用。
+  const commands = ctx.get('commands')
+  if (commands === undefined) {
+    console.warn('[dsh-file-extras] ctx.commands 缺席：跳过文件驱动的斜杠命令。')
+  } else {
+    // 扫目录是同步 IO + 动态 import，挂成异步任务，不阻塞插件启动。
+    void registerFileCommands(ctx, commands).catch((cause) => {
+      console.warn(`[dsh-file-extras] 注册斜杠命令失败：${messageOf(cause)}`)
+    })
+  }
+
   const webServer = ctx.get('webServer')
   const connection = ctx.get('connection')
   if (webServer === undefined || connection === undefined) {
@@ -373,6 +542,57 @@ export function apply(ctx) {
         }
       }))
       return { root, entries }
+    },
+
+    /**
+     * 取某个会话里**真实用户敲过的指令**，给输入框的 ↑/↓ 历史回填用。
+     *
+     * payload: { sessionId: string }
+     * value:   { sessionId: string, items: [{ seq, time, text }] }
+     *
+     * 数据源是 `ctx.sessionQuery.readSession()` 的**完整事件日志**，不是聊天视图里已加载的那一窗，
+     * 所以「更早」的指令也在（这正是它比从 DOM 里抠消息强的地方）。
+     *
+     * 过滤条件是 `type === 'user/message'` 且 `data.source.kind === 'user'`：事件日志里的
+     * user 角色消息有两大类 —— 人工输入 / steering，以及 `agent.inject()` 塞进去的系统上下文
+     * （AGENTS.md、技能目录、定时提醒、goal 续跑……）。后者的 source.kind 各自不同
+     * （`agent-instructions` / `skill-invocation` / `schedule` / `time-context` / `goal` …），
+     * 只有前者的 kind 恰好是 `'user'`，所以这一个判断就把系统注入全挡在外面。
+     *
+     * 连续重复的指令去重（连按两次同一条只留一条）；从最新往前截 MAX_HISTORY_ITEMS 条，
+     * 单条截 MAX_HISTORY_TEXT 字符，最后按 seq 升序返回。
+     */
+    async history(payload) {
+      const sessionId = payload?.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') {
+        throw new FileExtrasError('file-extras/bad-request', 'sessionId 必须是非空字符串')
+      }
+      const sessionQuery = ctx.get('sessionQuery')
+      if (sessionQuery === undefined) {
+        throw new FileExtrasError('file-extras/history-unavailable', 'ctx.sessionQuery 缺席：读不到会话事件日志')
+      }
+      let snapshot
+      try {
+        snapshot = await sessionQuery.readSession(sessionId)
+      } catch (cause) {
+        throw new FileExtrasError('file-extras/not-found', `读不到会话 ${sessionId}：${messageOf(cause)}`, { sessionId })
+      }
+      const items = []
+      for (const event of snapshot?.events ?? []) {
+        if (event?.type !== 'user/message') continue
+        const message = event.data
+        if (message?.source?.kind !== 'user') continue
+        const text = blocksToText(message.content)
+        if (text === '') continue
+        if (items.length > 0 && items[items.length - 1].text === text) continue
+        items.push({ seq: event.seq, time: event.time, text })
+      }
+      const tail = items.slice(-MAX_HISTORY_ITEMS).map((item) => ({
+        seq: item.seq,
+        time: item.time,
+        text: item.text.length > MAX_HISTORY_TEXT ? item.text.slice(0, MAX_HISTORY_TEXT) : item.text,
+      }))
+      return { sessionId, total: items.length, items: tail }
     },
 
     /**
@@ -669,5 +889,5 @@ export function apply(ctx) {
   }
 
   ctx.effect(() => webServer.register({ kind: 'prefix', path: CHANNEL, handler: handleRoute }), 'dsh-file-extras: rpc + bytes channel')
-  console.log(`[dsh-file-extras] 通道已注册：${CHANNEL}（RPC stat / GET download / POST upload）`)
+  console.log(`[dsh-file-extras] 通道已注册：${CHANNEL}（RPC stat / history / remove / GET download / POST upload）`)
 }

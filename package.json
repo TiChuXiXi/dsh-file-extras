@@ -1,7 +1,7 @@
 {
   "name": "dsh-file-extras",
-  "version": "0.2.0",
-  "description": "DSH Web GUI 的工作区文件树增强：行内显示大小与修改日期，右键菜单提供下载 / 上传 / @ 到对话 / 复制路径 / 删除（走回收站，跨平台）。",
+  "version": "0.3.0",
+  "description": "DSH Web GUI 日常操作增强：工作区文件树行内显示大小与修改日期，右键下载 / 上传 / @ 到对话 / 复制路径 / 删除（走回收站，跨平台）；另有 ~/.dsh/commands/*.md 驱动的斜杠命令与输入框 ↑/↓ 历史指令回填。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -38,6 +38,8 @@
     "file-manager",
     "context-menu",
     "file-mention",
+    "slash-command",
+    "prompt-history",
     "web-ui"
   ],
   "license": "MIT",
